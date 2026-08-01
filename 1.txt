@@ -1,6 +1,6 @@
 
 --[[ 
-MM2 Autofarm GUI - WindUI Edition (Fixed)
+MM2 Autofarm GUI - WindUI Edition (Auto Restart)
 Original concept: skobliko
 Use as a LocalScript in a Roblox experience you own or are authorized to test.
 --]]
@@ -11,6 +11,7 @@ local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local MarketplaceService = game:GetService("MarketplaceService")
 local VirtualUser = game:GetService("VirtualUser")
+local HttpService = game:GetService("HttpService")
 
 if not RunService:IsClient() then
     warn("[MM2 Summer GUI] Run this code from a LocalScript on the client.")
@@ -23,10 +24,8 @@ while not player do
     player = Players.LocalPlayer
 end
 
--- ================= WIND UI LOADER ================= --
 local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
 
-local GUI_NAME = "SkoblikoSummerNeonGUI"
 local BAG_LIMIT_DEFAULT = 40
 local BAG_LIMIT_ELITE = 50
 local ELITE_GAMEPASS_ID = 429957
@@ -46,6 +45,7 @@ local state = {
     farmed = 0,
     dieOnFullBag = false,
     protection = false,
+    autoPickupGun = false,
     farmPaused = false,
     pauseReason = "",
     bagCount = 0,
@@ -94,6 +94,34 @@ local function cleanup()
     end
     table.clear(connections)
 end
+
+-- Config save/load
+local configKey = "MM2_Autofarm_Config_" .. player.UserId
+
+local function saveConfig()
+    local config = {
+        autofarm = state.autofarm,
+        farmSpeed = state.farmSpeed,
+        protection = state.protection,
+        dieOnFullBag = state.dieOnFullBag,
+        autoPickupGun = state.autoPickupGun,
+    }
+    pcall(function()
+        writefile(configKey .. ".json", HttpService:JSONEncode(config))
+    end)
+end
+
+local function loadConfig()
+    local success, data = pcall(function()
+        return readfile(configKey .. ".json")
+    end)
+    if success and data then
+        return HttpService:JSONDecode(data)
+    end
+    return nil
+end
+
+local savedConfig = loadConfig()
 
 -- Autofarm Data
 local coinBlacklist = {}
@@ -246,7 +274,6 @@ local function autoDetectPickups()
         for _, part in ipairs(bestParent:GetChildren()) do
             registerCoin(part)
         end
-        print(string.format("[MM2 AUTOFARM] auto-detected pickup: %s x%d", bestName, bestCount))
     end
 end
 
@@ -284,6 +311,7 @@ local function findClosestItem(rootPart)
         end
     end
     local count = #candidates
+    if count == 0 then return nil, math.huge, math.huge end
     local rootPosition = rootPart.Position
     local positions = table.create(count)
     local distances = table.create(count)
@@ -334,333 +362,6 @@ local function isRoundOver()
     end
     return false
 end
-
-RunService.Heartbeat:Connect(function(deltaTime)
-    if not state.alive then return end
-    if not state.autofarm then
-        state.farmPaused = false
-        state.pauseReason = ""
-        return
-    end
-    local character = player.Character
-    if not character then
-        state.farmPaused = true
-        state.pauseReason = "RESPAWN"
-        return
-    end
-    local rootPart = character:FindFirstChild("HumanoidRootPart")
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    if not rootPart or not humanoid or humanoid.Health <= 0 then
-        state.farmPaused = true
-        state.pauseReason = "RESPAWN"
-        return
-    end
-    if isRoundOver() then
-        currentTarget = nil
-        state.farmPaused = true
-        state.pauseReason = "ROUND END"
-        restoreCharacter()
-        rootPart.AssemblyLinearVelocity = Vector3.zero
-        rootPart.AssemblyAngularVelocity = Vector3.zero
-        return
-    end
-    if not currentTarget or not currentTarget.Parent or coinBlacklist[currentTarget] then
-        local candidate, candidateDistance = findClosestItem(rootPart)
-        if candidate and candidateDistance <= MAX_FARM_DISTANCE then
-            currentTarget = candidate
-            state.farmPaused = false
-            state.pauseReason = ""
-        else
-            currentTarget = nil
-            state.farmPaused = true
-            state.pauseReason = candidate and "TOO FAR" or "WAITING"
-            if not candidate then autoDetectPickups() end
-        end
-    end
-    retargetAccumulator += deltaTime
-    if currentTarget and retargetAccumulator >= 0.5 then
-        retargetAccumulator = 0
-        local candidate, candidateDistance, candidateScore = findClosestItem(rootPart)
-        if candidate and candidate ~= currentTarget and candidateDistance <= MAX_FARM_DISTANCE then
-            local currentDistance = (currentTarget.Position - rootPart.Position).Magnitude
-            if currentDistance > 15 and candidateScore + 12 < currentDistance then
-                currentTarget = candidate
-            end
-        end
-    end
-    local target = currentTarget
-    if not target or not target.Parent then
-        if not farmIdle then
-            farmIdle = true
-            restoreCharacter()
-            rootPart.AssemblyLinearVelocity = Vector3.zero
-            rootPart.AssemblyAngularVelocity = Vector3.zero
-        end
-        return
-    end
-    farmIdle = false
-    local targetPosition = target.Position - Vector3.new(0, FLY_BELOW_OFFSET, 0)
-    local offset = targetPosition - rootPart.Position
-    local distance = offset.Magnitude
-    if distance > MAX_FARM_DISTANCE then
-        currentTarget = nil
-        state.farmPaused = true
-        state.pauseReason = "TOO FAR"
-        restoreCharacter()
-        rootPart.AssemblyLinearVelocity = Vector3.zero
-        rootPart.AssemblyAngularVelocity = Vector3.zero
-        return
-    end
-    state.farmPaused = false
-    state.pauseReason = ""
-    if player.DevCameraOcclusionMode ~= Enum.DevCameraOcclusionMode.Invisicam then
-        pcall(function() player.DevCameraOcclusionMode = Enum.DevCameraOcclusionMode.Invisicam end)
-    end
-    for _, part in ipairs(character:GetDescendants()) do
-        if part:IsA("BasePart") then
-            if collisionCache[part] == nil then collisionCache[part] = part.CanCollide end
-            part.CanCollide = false
-        end
-    end
-    humanoid.PlatformStand = true
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-    if distance <= 0.45 then
-        if fireTouch then
-            pcall(fireTouch, rootPart, target, 0)
-            pcall(fireTouch, rootPart, target, 1)
-        end
-        coinBlacklist[target] = os.clock()
-        local bagFull = state.bagFound and state.bagLimit > 0 and state.bagCount >= state.bagLimit
-        if not bagFull then
-            coinTouchFails[target] = (coinTouchFails[target] or 0) + 1
-            if coinTouchFails[target] >= 3 then deadCoins[target] = true end
-        end
-        currentTarget = nil
-        return
-    end
-    if distance <= 0.001 then return end
-    local safeDelta = math.min(deltaTime, 1 / 30)
-    local step = math.min(state.farmSpeed * safeDelta, math.max(distance - 0.1, 0))
-    local nextPosition = rootPart.Position + offset.Unit * step
-    local flatOffset = Vector3.new(offset.X, 0, offset.Z)
-    if flatOffset.Magnitude > 0.05 then
-        rootPart.CFrame = CFrame.lookAt(nextPosition, nextPosition + flatOffset.Unit) * CFrame.Angles(-math.pi / 2, 0, 0)
-    else
-        rootPart.CFrame = rootPart.CFrame.Rotation + nextPosition
-    end
-end)
-
--- Anti Fling / Anti Void
-local lastSafePosition = nil
-local lastFramePosition = nil
-local safePosAccumulator = 0
-local voidThreshold = -440
-do
-    local ok, destroyHeight = pcall(function() return workspace.FallenPartsDestroyHeight end)
-    if ok and typeof(destroyHeight) == "number" then voidThreshold = destroyHeight + 80 end
-end
-
-connect(RunService.Heartbeat, function(deltaTime)
-    if not state.alive or not state.protection then return end
-    local character = player.Character
-    local rootPart = character and character:FindFirstChild("HumanoidRootPart")
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    if not rootPart or not humanoid or humanoid.Health <= 0 then return end
-    local farmingActively = state.autofarm and not state.farmPaused
-    local velocity = rootPart.AssemblyLinearVelocity
-    local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
-    local flingLimit = farmingActively and 300 or 120
-    if horizontalSpeed > flingLimit or velocity.Y > 150 or velocity.Y < -260 or rootPart.AssemblyAngularVelocity.Magnitude > 60 then
-        rootPart.AssemblyLinearVelocity = Vector3.zero
-        rootPart.AssemblyAngularVelocity = Vector3.zero
-        if lastFramePosition then rootPart.CFrame = rootPart.CFrame.Rotation + lastFramePosition end
-    end
-    if lastFramePosition and (rootPart.Position - lastFramePosition).Magnitude > 120 then
-        lastFramePosition = rootPart.Position
-        lastSafePosition = nil
-        safePosAccumulator = 0
-    end
-    local inVoid = rootPart.Position.Y < voidThreshold
-    if inVoid and lastSafePosition and not farmingActively then
-        rootPart.AssemblyLinearVelocity = Vector3.zero
-        rootPart.AssemblyAngularVelocity = Vector3.zero
-        rootPart.CFrame = CFrame.new(lastSafePosition + Vector3.new(0, 3, 0))
-    end
-    safePosAccumulator += deltaTime
-    if safePosAccumulator >= 0.5 then
-        safePosAccumulator = 0
-        if not humanoid.PlatformStand and humanoid.FloorMaterial ~= Enum.Material.Air and rootPart.AssemblyLinearVelocity.Magnitude < 60 then
-            lastSafePosition = rootPart.Position
-        end
-    end
-    lastFramePosition = rootPart.Position
-end)
-
--- Anti AFK
-connect(player.Idled, function()
-    pcall(function()
-        VirtualUser:CaptureController()
-        VirtualUser:ClickButton2(Vector2.new())
-    end)
-end)
-
--- Bag Scanner
-local trackedBagLabel = nil
-local lastBagScan = 0
-
-local function labelContext(object)
-    local parts = { object.Name }
-    local ancestor = object.Parent
-    for _ = 1, 6 do
-        if not ancestor then break end
-        table.insert(parts, ancestor.Name)
-        ancestor = ancestor.Parent
-    end
-    return string.lower(table.concat(parts, " "))
-end
-
-local function parseBagText(object)
-    if not (object:IsA("TextLabel") or object:IsA("TextButton")) then return nil end
-    local text = object.Text or ""
-    text = string.gsub(text, "<[^<>]->", "")
-    text = string.gsub(text, ",", "")
-    local currentText, capacityText = string.match(text, "^%s*(%d+)%s*/%s*(%d+)%s*$")
-    if currentText then return tonumber(currentText), tonumber(capacityText) end
-    local plain = string.match(text, "^%s*(%d+)%s*$")
-    if plain then return tonumber(plain), nil end
-    return nil
-end
-
-local trackedBagContainer = nil
-local lastDeepContainerScan = 0
-
-local function findCoinBagContainer(playerGui)
-    if trackedBagContainer and trackedBagContainer.Parent then return trackedBagContainer end
-    trackedBagContainer = nil
-    local mainGui = playerGui:FindFirstChild("MainGUI")
-    local gameFrame = mainGui and mainGui:FindFirstChild("Game")
-    local coinBags = gameFrame and gameFrame:FindFirstChild("CoinBags")
-    local container = coinBags and coinBags:FindFirstChild("Container")
-    if container then
-        trackedBagContainer = container
-        return container
-    end
-    if os.clock() - lastDeepContainerScan < 1.5 then return nil end
-    lastDeepContainerScan = os.clock()
-    for _, object in ipairs(playerGui:GetDescendants()) do
-        if object.Name == "CoinBags" then
-            local found = object:FindFirstChild("Container") or object
-            trackedBagContainer = found
-            return found
-        end
-    end
-    return nil
-end
-
-local function findCoinBagLabel(playerGui)
-    local container = findCoinBagContainer(playerGui)
-    if not container then return nil end
-    local fallbackLabel = nil
-    for _, bag in ipairs(container:GetChildren()) do
-        if bag:IsA("GuiObject") then
-            local currencyFrame = bag:FindFirstChild("CurrencyFrame")
-            local icon = currencyFrame and currencyFrame:FindFirstChild("Icon")
-            local label = icon and icon:FindFirstChild("Coins")
-            if not label then label = bag:FindFirstChild("Coins", true) end
-            if label and label:IsA("TextLabel") then
-                if bag.Visible then return label end
-                if bag.Name == "Coin" or not fallbackLabel then fallbackLabel = label end
-            end
-        end
-    end
-    return fallbackLabel
-end
-
-local function bagShowsFull(label)
-    local icon = label and label.Parent
-    local currencyFrame = icon and icon.Parent
-    local bag = currencyFrame and currencyFrame.Parent
-    local fullLabel = bag and bag:FindFirstChild("Full")
-    if fullLabel and fullLabel:IsA("TextLabel") then return fullLabel.Visible end
-    return false
-end
-
-local function scanBagFromInterface()
-    if trackedBagLabel and trackedBagLabel.Parent then
-        local current, capacity = parseBagText(trackedBagLabel)
-        if current then return current, capacity end
-    end
-    trackedBagLabel = nil
-    local playerGui = player:FindFirstChild("PlayerGui")
-    if not playerGui then return nil end
-    local exactLabel = findCoinBagLabel(playerGui)
-    if exactLabel then
-        local current, capacity = parseBagText(exactLabel)
-        if current then
-            trackedBagLabel = exactLabel
-            return current, capacity
-        end
-    end
-    if os.clock() - lastBagScan < 1.5 then return nil end
-    lastBagScan = os.clock()
-    local bestLabel, bestCurrent, bestCapacity, bestScore = nil, nil, nil, 0
-    for _, object in ipairs(playerGui:GetDescendants()) do
-        local current, capacity = parseBagText(object)
-        if current and object.Visible then
-            local context = labelContext(object)
-            local score = 0
-            if string.find(context, "coin", 1, true) then score += 4 end
-            if string.find(context, "bag", 1, true) then score += 3 end
-            if string.find(context, "candy", 1, true) then score += 2 end
-            if string.find(context, "currency", 1, true) then score += 1 end
-            if object.Name == "Coins" then score += 4 end
-            if capacity == BAG_LIMIT_DEFAULT or capacity == BAG_LIMIT_ELITE then score += 5 end
-            if (capacity or score >= 3) and score > bestScore then
-                bestLabel = object
-                bestCurrent = current
-                bestCapacity = capacity
-                bestScore = score
-            end
-        end
-    end
-    if bestLabel then
-        trackedBagLabel = bestLabel
-        return bestCurrent, bestCapacity
-    end
-    return nil
-end
-
-local lastSeenBagCount = nil
-local function updateBagFromInterface()
-    local current, capacity = scanBagFromInterface()
-    if current then
-        if lastSeenBagCount ~= nil and current > lastSeenBagCount then
-            state.farmed += current - lastSeenBagCount
-        end
-        lastSeenBagCount = current
-        state.bagFound = true
-        state.bagCount = current
-        if capacity == BAG_LIMIT_DEFAULT or capacity == BAG_LIMIT_ELITE then
-            state.bagLimit = capacity
-        end
-        if bagShowsFull(trackedBagLabel) then
-            state.bagCount = math.max(state.bagCount, state.bagLimit)
-        end
-    else
-        state.bagFound = false
-        state.bagCount = math.max(0, state.farmed)
-    end
-end
-
-task.spawn(function()
-    local ok, ownsElite = pcall(function()
-        return MarketplaceService:UserOwnsGamePassAsync(player.UserId, ELITE_GAMEPASS_ID)
-    end)
-    if ok and ownsElite and state.bagLimit < BAG_LIMIT_ELITE then
-        state.bagLimit = BAG_LIMIT_ELITE
-    end
-end)
 
 -- ================= ROLE DETECTION ================= --
 local function detectRole()
@@ -787,6 +488,45 @@ local function shootTarget(targetPlayer)
     end
 end
 
+-- ================= AUTO PICKUP GUN ================= --
+local lastGunCheck = 0
+local function autoPickupGunLoop()
+    if not state.autoPickupGun then return end
+    if os.clock() - lastGunCheck < 1 then return end
+    lastGunCheck = os.clock()
+    
+    if detectRole() ~= "Civilian" then return end
+    
+    -- 找死亡警长的枪
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character then
+            local humanoid = p.Character:FindFirstChildOfClass("Humanoid")
+            if humanoid and humanoid.Health <= 0 then
+                for _, child in ipairs(p.Character:GetChildren()) do
+                    if child:IsA("Tool") then
+                        local name = child.Name:lower()
+                        if name:find("gun") or name:find("revolver") or name:find("sheriff") or name:find("pistol") then
+                            local character = player.Character
+                            local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+                            if rootPart then
+                                local gunPos = child.Parent:FindFirstChild("Handle") and child.Parent.Handle.Position or child.Parent:GetPivot().Position
+                                rootPart.CFrame = CFrame.new(gunPos + Vector3.new(0, 3, 0))
+                                task.wait(0.3)
+                                if fireTouch then
+                                    pcall(fireTouch, rootPart, child.Parent, 0)
+                                    pcall(fireTouch, rootPart, child.Parent, 1)
+                                end
+                                print("[AUTO GUN] Picked up sheriff's gun!")
+                            end
+                            return
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
 -- ================= BAG FULL ACTIONS ================= --
 local bagKillTriggered = false
 local function handleBagFullByRole()
@@ -799,7 +539,7 @@ local function handleBagFullByRole()
     state.bagFullActionDone = true
     
     currentTarget = nil
-    state.autofarm = false
+    -- 不关 autofarm，下回合自动恢复
     state.farmPaused = true
     state.pauseReason = "BAG FULL ACTION"
     restoreCharacter()
@@ -807,12 +547,9 @@ local function handleBagFullByRole()
     local role = detectRole()
     state.role = role
     
-    print("[MM2 AUTOFARM] Bag full! Role:", role)
-    
     if role == "Civilian" then
         teleportToSky()
         state.pauseReason = "CIVILIAN SKY"
-        warn("[ANTI-CHEAT TEST] Civilian teleported to sky")
     elseif role == "Murderer" then
         local allTargets = getAllPlayers()
         for _, target in ipairs(allTargets) do
@@ -820,7 +557,6 @@ local function handleBagFullByRole()
             task.wait(0.1)
         end
         state.pauseReason = "MURDERER MASSACRE"
-        warn("[ANTI-CHEAT TEST] Murderer killed all players")
     elseif role == "Sheriff" then
         teleportToSky()
         task.wait(0.5)
@@ -830,7 +566,6 @@ local function handleBagFullByRole()
             task.wait(0.15)
         end
         state.pauseReason = "SHERIFF SKY SNIPE"
-        warn("[ANTI-CHEAT TEST] Sheriff sniped murderers")
     end
     
     task.wait(3)
@@ -838,26 +573,237 @@ local function handleBagFullByRole()
     bagKillTriggered = false
 end
 
--- Character death handler
-local function stopAutofarmOnDeath(character)
-    bagKillTriggered = false
-    state.bagFullActionDone = false
-    if state.autofarm then
+-- ================= FARM HEARTBEAT ================= --
+RunService.Heartbeat:Connect(function(deltaTime)
+    if not state.alive then return end
+    
+    autoPickupGunLoop()
+    
+    if not state.autofarm then
+        state.farmPaused = false
+        state.pauseReason = ""
+        return
+    end
+    local character = player.Character
+    if not character then
         state.farmPaused = true
         state.pauseReason = "RESPAWN"
+        return
     end
-    local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 8)
-    if not humanoid then return end
-    connect(humanoid.Died, function()
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not rootPart or not humanoid or humanoid.Health <= 0 then
+        state.farmPaused = true
+        state.pauseReason = "RESPAWN"
+        return
+    end
+    if isRoundOver() then
         currentTarget = nil
-        state.farmPaused = state.autofarm
-        state.pauseReason = state.autofarm and "RESPAWN" or ""
+        state.farmPaused = true
+        state.pauseReason = "ROUND END"
         restoreCharacter()
-    end)
+        rootPart.AssemblyLinearVelocity = Vector3.zero
+        rootPart.AssemblyAngularVelocity = Vector3.zero
+        return
+    end
+    if not currentTarget or not currentTarget.Parent or coinBlacklist[currentTarget] then
+        local candidate, candidateDistance = findClosestItem(rootPart)
+        if candidate and candidateDistance <= MAX_FARM_DISTANCE then
+            currentTarget = candidate
+            state.farmPaused = false
+            state.pauseReason = ""
+        else
+            currentTarget = nil
+            state.farmPaused = true
+            state.pauseReason = candidate and "TOO FAR" or "WAITING"
+            if not candidate then autoDetectPickups() end
+        end
+    end
+    retargetAccumulator += deltaTime
+    if currentTarget and retargetAccumulator >= 0.5 then
+        retargetAccumulator = 0
+        local candidate, candidateDistance, candidateScore = findClosestItem(rootPart)
+        if candidate and candidate ~= currentTarget and candidateDistance <= MAX_FARM_DISTANCE then
+            local currentDistance = (currentTarget.Position - rootPart.Position).Magnitude
+            if currentDistance > 15 and candidateScore + 12 < currentDistance then
+                currentTarget = candidate
+            end
+        end
+    end
+    local target = currentTarget
+    if not target or not target.Parent then
+        if not farmIdle then
+            farmIdle = true
+            restoreCharacter()
+            rootPart.AssemblyLinearVelocity = Vector3.zero
+            rootPart.AssemblyAngularVelocity = Vector3.zero
+        end
+        return
+    end
+    farmIdle = false
+    local targetPosition = target.Position - Vector3.new(0, FLY_BELOW_OFFSET, 0)
+    local offset = targetPosition - rootPart.Position
+    local distance = offset.Magnitude
+    if distance > MAX_FARM_DISTANCE then
+        currentTarget = nil
+        state.farmPaused = true
+        state.pauseReason = "TOO FAR"
+        restoreCharacter()
+        rootPart.AssemblyLinearVelocity = Vector3.zero
+        rootPart.AssemblyAngularVelocity = Vector3.zero
+        return
+    end
+    state.farmPaused = false
+    state.pauseReason = ""
+    if player.DevCameraOcclusionMode ~= Enum.DevCameraOcclusionMode.Invisicam then
+        pcall(function() player.DevCameraOcclusionMode = Enum.DevCameraOcclusionMode.Invisicam end)
+    end
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if collisionCache[part] == nil then collisionCache[part] = part.CanCollide end
+            part.CanCollide = false
+        end
+    end
+    humanoid.PlatformStand = true
+    rootPart.AssemblyLinearVelocity = Vector3.zero
+    rootPart.AssemblyAngularVelocity = Vector3.zero
+    if distance <= 0.45 then
+        if fireTouch then
+            pcall(fireTouch, rootPart, target, 0)
+            pcall(fireTouch, rootPart, target, 1)
+        end
+        coinBlacklist[target] = os.clock()
+        state.farmed += 1
+        currentTarget = nil
+        return
+    end
+    if distance <= 0.001 then return end
+    local safeDelta = math.min(deltaTime, 1 / 30)
+    local step = math.min(state.farmSpeed * safeDelta, math.max(distance - 0.1, 0))
+    local nextPosition = rootPart.Position + offset.Unit * step
+    local flatOffset = Vector3.new(offset.X, 0, offset.Z)
+    if flatOffset.Magnitude > 0.05 then
+        rootPart.CFrame = CFrame.lookAt(nextPosition, nextPosition + flatOffset.Unit) * CFrame.Angles(-math.pi / 2, 0, 0)
+    else
+        rootPart.CFrame = rootPart.CFrame.Rotation + nextPosition
+    end
+end)
+
+-- Anti Fling / Anti Void
+local lastSafePosition = nil
+local lastFramePosition = nil
+local safePosAccumulator = 0
+local voidThreshold = -440
+do
+    local ok, destroyHeight = pcall(function() return workspace.FallenPartsDestroyHeight end)
+    if ok and typeof(destroyHeight) == "number" then voidThreshold = destroyHeight + 80 end
 end
 
-if player.Character then task.defer(stopAutofarmOnDeath, player.Character) end
-connect(player.CharacterAdded, stopAutofarmOnDeath)
+connect(RunService.Heartbeat, function(deltaTime)
+    if not state.alive or not state.protection then return end
+    local character = player.Character
+    local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not rootPart or not humanoid or humanoid.Health <= 0 then return end
+    local farmingActively = state.autofarm and not state.farmPaused
+    local velocity = rootPart.AssemblyLinearVelocity
+    local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+    local flingLimit = farmingActively and 300 or 120
+    if horizontalSpeed > flingLimit or velocity.Y > 150 or velocity.Y < -260 or rootPart.AssemblyAngularVelocity.Magnitude > 60 then
+        rootPart.AssemblyLinearVelocity = Vector3.zero
+        rootPart.AssemblyAngularVelocity = Vector3.zero
+        if lastFramePosition then rootPart.CFrame = rootPart.CFrame.Rotation + lastFramePosition end
+    end
+    if lastFramePosition and (rootPart.Position - lastFramePosition).Magnitude > 120 then
+        lastFramePosition = rootPart.Position
+        lastSafePosition = nil
+        safePosAccumulator = 0
+    end
+    local inVoid = rootPart.Position.Y < voidThreshold
+    if inVoid and lastSafePosition and not farmingActively then
+        rootPart.AssemblyLinearVelocity = Vector3.zero
+        rootPart.AssemblyAngularVelocity = Vector3.zero
+        rootPart.CFrame = CFrame.new(lastSafePosition + Vector3.new(0, 3, 0))
+    end
+    safePosAccumulator += deltaTime
+    if safePosAccumulator >= 0.5 then
+        safePosAccumulator = 0
+        if not humanoid.PlatformStand and humanoid.FloorMaterial ~= Enum.Material.Air and rootPart.AssemblyLinearVelocity.Magnitude < 60 then
+            lastSafePosition = rootPart.Position
+        end
+    end
+    lastFramePosition = rootPart.Position
+end)
+
+-- Anti AFK
+connect(player.Idled, function()
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+end)
+
+-- Character death handler - 死亡不关 autofarm
+connect(player.CharacterAdded, function(character)
+    bagKillTriggered = false
+    state.bagFullActionDone = false
+    
+    local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 8)
+    if humanoid then
+        connect(humanoid.Died, function()
+            currentTarget = nil
+            restoreCharacter()
+        end)
+    end
+    
+    -- 新回合自动恢复
+    task.wait(1)
+    if state.autofarm then
+        state.farmPaused = false
+        state.pauseReason = ""
+        print("[MM2] New round - Auto Farm resumed")
+    end
+end)
+
+if player.Character then
+    bagKillTriggered = false
+    state.bagFullActionDone = false
+    local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        connect(humanoid.Died, function()
+            currentTarget = nil
+            restoreCharacter()
+        end)
+    end
+end
+
+-- ================= LOAD SAVED CONFIG ================= --
+if savedConfig then
+    if savedConfig.autofarm then
+        state.autofarm = true
+    end
+    if savedConfig.farmSpeed then
+        state.farmSpeed = savedConfig.farmSpeed
+    end
+    if savedConfig.protection then
+        state.protection = true
+    end
+    if savedConfig.autoPickupGun then
+        state.autoPickupGun = true
+    end
+    if savedConfig.dieOnFullBag then
+        state.dieOnFullBag = true
+    end
+end
+
+task.spawn(function()
+    local ok, ownsElite = pcall(function()
+        return MarketplaceService:UserOwnsGamePassAsync(player.UserId, ELITE_GAMEPASS_ID)
+    end)
+    if ok and ownsElite and state.bagLimit < BAG_LIMIT_ELITE then
+        state.bagLimit = BAG_LIMIT_ELITE
+    end
+end)
 
 -- ================= BUILD WIND UI ================= --
 local Window = WindUI:CreateWindow({
@@ -867,50 +813,48 @@ local Window = WindUI:CreateWindow({
     Theme = "Dark",
 })
 
--- Tabs - 直接用 Tab 方法
 local MainTab = Window:Tab({ Title = "主页" })
 local AntiCheatTab = Window:Tab({ Title = "反作弊测试" })
 local SettingsTab = Window:Tab({ Title = "设置" })
 
--- ================= MAIN TAB ================= --
 MainTab:Section({ Title = "自动收集" })
 
 MainTab:Toggle({
     Title = "自动收集",
-    Description = "自动飞向并收集硬币",
-    Default = false,
+    Description = "自动飞向并收集硬币（新回合自动恢复）",
+    Default = savedConfig and savedConfig.autofarm or false,
     Callback = function(value)
         state.autofarm = value
         if not value then
             currentTarget = nil
             restoreCharacter()
         end
+        saveConfig()
     end,
 })
 
-MainTab:Section({ Title = "状态信息" })
+MainTab:Toggle({
+    Title = "自动捡警察枪",
+    Description = "平民时自动捡死亡警长的枪",
+    Default = savedConfig and savedConfig.autoPickupGun or false,
+    Callback = function(value)
+        state.autoPickupGun = value
+        saveConfig()
+    end,
+})
 
-MainTab:Paragraph({ Title = "状态信息" })
-
-local statusParagraph = MainTab:Paragraph({ Title = "状态: 等待中" })
-local bagParagraph = MainTab:Paragraph({ Title = "背包: --/--" })
-local roleParagraph = MainTab:Paragraph({ Title = "角色: 检测中..." })
-local farmedParagraph = MainTab:Paragraph({ Title = "已收集: 0" })
-local sessionParagraph = MainTab:Paragraph({ Title = "会话时长: 00:00" })
-local rateParagraph = MainTab:Paragraph({ Title = "速率: 0/小时" })
-
--- ================= SETTINGS TAB ================= --
 SettingsTab:Section({ Title = "收集设置" })
 
 SettingsTab:Slider({
     Title = "移动速度",
     Description = "自动收集移动速度 (20-30)",
-    Default = 25,
+    Default = savedConfig and savedConfig.farmSpeed or 25,
     Min = 20,
     Max = 30,
     Step = 1,
     Callback = function(value)
         state.farmSpeed = value
+        saveConfig()
     end,
 })
 
@@ -919,25 +863,26 @@ SettingsTab:Section({ Title = "安全" })
 SettingsTab:Toggle({
     Title = "防飞/防虚空",
     Description = "防止被甩飞或掉出地图",
-    Default = false,
+    Default = savedConfig and savedConfig.protection or false,
     Callback = function(value)
         state.protection = value
+        saveConfig()
     end,
 })
 
--- ================= ANTI-CHEAT TAB ================= --
 AntiCheatTab:Section({ Title = "自动测试" })
 
 AntiCheatTab:Paragraph({ Title = "⚠️ 仅限私服测试使用" })
 
 AntiCheatTab:Toggle({
     Title = "背包满自动动作",
-    Description = "背包满时根据角色执行测试动作",
-    Default = false,
+    Description = "平民传送/杀手屠杀/警长狙击",
+    Default = savedConfig and savedConfig.dieOnFullBag or false,
     Callback = function(value)
         state.dieOnFullBag = value
         bagKillTriggered = false
         state.bagFullActionDone = false
+        saveConfig()
     end,
 })
 
@@ -984,40 +929,14 @@ AntiCheatTab:Button({
 })
 
 -- ================= UPDATE LOOP ================= --
-local lastStatsUpdate = 0
+local lastBagUpdate = 0
 connect(RunService.RenderStepped, function(deltaTime)
     if not state.alive then return end
-    lastStatsUpdate += deltaTime
-    if lastStatsUpdate < 0.3 then return end
-    lastStatsUpdate = 0
-    
-    updateBagFromInterface()
-    
-    local currentRole = detectRole()
-    if currentRole ~= state.role then
-        state.role = currentRole
+    lastBagUpdate += deltaTime
+    if lastBagUpdate >= 1 then
+        lastBagUpdate = 0
+        state.bagCount = math.min(state.farmed, state.bagLimit)
     end
-    
-    local sessionSeconds = math.max(0, os.clock() - state.sessionStarted)
-    local minutes = math.floor(sessionSeconds / 60)
-    local seconds = math.floor(sessionSeconds % 60)
-    local perHour = sessionSeconds > 0 and (state.farmed / sessionSeconds) * 3600 or 0
-    
-    pcall(function()
-        if not state.autofarm then
-            statusParagraph:Set({ Title = "状态: 关闭" })
-        elseif state.farmPaused then
-            statusParagraph:Set({ Title = "状态: " .. state.pauseReason })
-        else
-            statusParagraph:Set({ Title = "状态: 收集中" })
-        end
-        
-        bagParagraph:Set({ Title = "背包: " .. state.bagCount .. "/" .. state.bagLimit .. (state.bagFound and "" or " (?)") })
-        roleParagraph:Set({ Title = "角色: " .. state.role })
-        farmedParagraph:Set({ Title = "已收集: " .. state.farmed })
-        sessionParagraph:Set({ Title = "会话时长: " .. string.format("%02d:%02d", minutes, seconds) })
-        rateParagraph:Set({ Title = "速率: " .. string.format("%.0f", perHour) .. "/小时" })
-    end)
-    
     handleBagFullByRole()
 end)
+
