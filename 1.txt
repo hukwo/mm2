@@ -1,0 +1,2042 @@
+--[[ 
+MM2 Autofarm GUI Original concept: skobliko 
+Use as a LocalScript in a Roblox experience you own or are authorized to test. 
+--]] 
+
+local Players = game:GetService("Players") 
+local TweenService = game:GetService("TweenService") 
+local UserInputService = game:GetService("UserInputService") 
+local RunService = game:GetService("RunService") 
+local MarketplaceService = game:GetService("MarketplaceService") 
+local VirtualUser = game:GetService("VirtualUser") 
+
+if not RunService:IsClient() then 
+    warn("[MM2 Summer GUI] Run this code from a LocalScript on the client.") 
+    return 
+end 
+
+local player = Players.LocalPlayer 
+while not player do 
+    Players:GetPropertyChangedSignal("LocalPlayer"):Wait() 
+    player = Players.LocalPlayer 
+end 
+
+local GUI_NAME = "SkoblikoSummerNeonGUI" 
+local WINDOW_WIDTH = 320 
+local WINDOW_HEIGHT = 420 
+local COLLAPSED_HEIGHT = 70 
+local BAG_LIMIT_DEFAULT = 40 -- standard MM2 coin bag 
+local BAG_LIMIT_ELITE = 50 -- ELITE gamepass bag (+10 coins) 
+local ELITE_GAMEPASS_ID = 429957 -- MM2 "Elite" gamepass 
+local MAX_FARM_DISTANCE = 180 
+
+-- Executor touch spoof: lets the character stay deep under the map while the coin hitbox is still triggered remotely.
+local fireTouch = (typeof(firetouchinterest) == "function" and firetouchinterest) 
+    or (typeof(firetouchtransmitter) == "function" and firetouchtransmitter) 
+    or nil 
+
+-- Stay deep under the map when touch spoofing works, gentle offset otherwise.
+local FLY_BELOW_OFFSET = fireTouch and 2.8 or 0.75 
+
+-- Original camera occlusion mode, restored when farming stops. 
+local originalOcclusionMode = player.DevCameraOcclusionMode 
+
+local Theme = { 
+    Navy = Color3.fromRGB(5, 13, 36), 
+    NavySoft = Color3.fromRGB(10, 29, 65), 
+    Card = Color3.fromRGB(17, 39, 76), 
+    CardHover = Color3.fromRGB(24, 54, 94), 
+    OrangeNeon = Color3.fromRGB(255, 147, 45), 
+    OrangeSoft = Color3.fromRGB(255, 112, 35), 
+    OrangeBright = Color3.fromRGB(255, 190, 105), 
+    Red = Color3.fromRGB(255, 91, 104), 
+    Cyan = Color3.fromRGB(44, 226, 222), 
+    Aqua = Color3.fromRGB(45, 157, 222), 
+    Blue = Color3.fromRGB(57, 107, 238), 
+    Gold = Color3.fromRGB(255, 214, 99), 
+    Orange = Color3.fromRGB(255, 155, 88), 
+    Coral = Color3.fromRGB(255, 111, 120), 
+    White = Color3.fromRGB(244, 251, 255), 
+    Muted = Color3.fromRGB(159, 184, 211), 
+    Dim = Color3.fromRGB(76, 102, 137), 
+} 
+
+local function create(className, properties, parent) 
+    local object = Instance.new(className) 
+    for property, value in pairs(properties or {}) do 
+        object[property] = value 
+    end 
+    object.Parent = parent 
+    return object 
+end 
+
+local function addCorner(parent, radius) 
+    return create("UICorner", { CornerRadius = UDim.new(0, radius) }, parent) 
+end 
+
+local function addStroke(parent, color, thickness, transparency) 
+    return create("UIStroke", { 
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border, 
+        Color = color, 
+        Thickness = thickness or 1, 
+        Transparency = transparency or 0, 
+    }, parent) 
+end 
+
+local function addGradient(parent, colors, rotation, transparency) 
+    local keypoints = {} 
+    for index, entry in ipairs(colors) do 
+        keypoints[index] = ColorSequenceKeypoint.new(entry[1], entry[2]) 
+    end 
+    return create("UIGradient", { 
+        Color = ColorSequence.new(keypoints), 
+        Rotation = rotation or 0, 
+        Transparency = transparency or NumberSequence.new(0), 
+    }, parent) 
+end 
+
+local activeTweens = setmetatable({}, { __mode = "k" }) 
+
+local function smoothTween(object, duration, goals, style, direction) 
+    if activeTweens[object] then 
+        activeTweens[object]:Cancel() 
+    end 
+    local animation = TweenService:Create( 
+        object, 
+        TweenInfo.new( 
+            duration or 0.28, 
+            style or Enum.EasingStyle.Sine, 
+            direction or Enum.EasingDirection.Out 
+        ), 
+        goals 
+    ) 
+    activeTweens[object] = animation 
+    animation.Completed:Once(function() 
+        if activeTweens[object] == animation then 
+            activeTweens[object] = nil 
+        end 
+    end) 
+    animation:Play() 
+    return animation 
+end 
+
+local guiParent = player:WaitForChild("PlayerGui") 
+local previous = guiParent:FindFirstChild(GUI_NAME) 
+if previous then 
+    previous:Destroy() 
+end 
+
+local screenGui = create("ScreenGui", { 
+    Name = GUI_NAME, 
+    DisplayOrder = 1000, 
+    IgnoreGuiInset = true, 
+    ResetOnSpawn = false, 
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling, 
+}, guiParent) 
+
+local state = { 
+    alive = true, 
+    closing = false, 
+    minimized = false, 
+    autofarm = false, 
+    farmSpeed = 25, 
+    farmed = 0, 
+    dieOnFullBag = false, 
+    protection = false, 
+    farmPaused = false, 
+    pauseReason = "", 
+    bagCount = 0, 
+    bagLimit = BAG_LIMIT_DEFAULT, 
+    bagFound = false, 
+    sessionStarted = os.clock(), 
+} 
+
+local connections = {} 
+local farmConnection 
+local cameraConnection 
+local cleaned = false 
+local collisionCache = {} 
+
+local function connect(signal, callback) 
+    local connection = signal:Connect(callback) 
+    table.insert(connections, connection) 
+    return connection 
+end 
+
+local function restoreCharacter() 
+    pcall(function() 
+        player.DevCameraOcclusionMode = originalOcclusionMode 
+    end) 
+    local character = player.Character 
+    if not character then return end 
+    local humanoid = character:FindFirstChildOfClass("Humanoid") 
+    if humanoid then 
+        humanoid.PlatformStand = false 
+        humanoid.AutoRotate = true 
+    end 
+    for part, oldCanCollide in pairs(collisionCache) do 
+        if part and part.Parent then 
+            part.CanCollide = oldCanCollide 
+        end 
+    end 
+    table.clear(collisionCache) 
+end 
+
+local function cleanup() 
+    if cleaned then return end 
+    cleaned = true 
+    state.alive = false 
+    state.autofarm = false 
+    restoreCharacter() 
+    if cameraConnection then 
+        cameraConnection:Disconnect() 
+        cameraConnection = nil 
+    end 
+    if farmConnection then 
+        farmConnection:Disconnect() 
+        farmConnection = nil 
+    end 
+    for _, connection in ipairs(connections) do 
+        connection:Disconnect() 
+    end 
+    table.clear(connections) 
+end 
+
+connect(screenGui.AncestryChanged, function(_, parent) 
+    if parent == nil then cleanup() end 
+end) 
+
+-- Autofarm Data
+local coinBlacklist = {} 
+local coinTouchFails = setmetatable({}, { __mode = "k" }) 
+local deadCoins = setmetatable({}, { __mode = "k" }) 
+local coinHadVisual = setmetatable({}, { __mode = "k" }) 
+local countedCoins = setmetatable({}, { __mode = "k" }) 
+local currentTarget 
+local retargetAccumulator = 0 
+local farmIdle = false 
+
+-- ================= COIN RADAR ================= --
+local coinSet = {} 
+local trackedContainers = {} 
+local lastRadarSweep = 0 
+local lenientContainers = {} 
+local detectedPickupNames = {} 
+
+local function isCoinPart(coin) 
+    if not coin:IsA("BasePart") then return false end 
+    if string.find(coin.Name, "Server", 1, true) then return true end 
+    if detectedPickupNames[coin.Name] then return true end 
+    return lenientContainers[coin.Parent] == true 
+end 
+
+local function registerCoin(coin) 
+    if isCoinPart(coin) then coinSet[coin] = true end 
+end 
+
+local function unregisterCoin(coin) 
+    coinSet[coin] = nil 
+    coinBlacklist[coin] = nil 
+    coinTouchFails[coin] = nil 
+    deadCoins[coin] = nil 
+    coinHadVisual[coin] = nil 
+end 
+
+local function watchContainer(container) 
+    if trackedContainers[container] then return end 
+    trackedContainers[container] = true 
+    connect(container.ChildAdded, registerCoin) 
+    connect(container.ChildRemoved, unregisterCoin) 
+    for _, coin in ipairs(container:GetChildren()) do 
+        registerCoin(coin) 
+    end 
+end 
+
+local function radarSweep(force) 
+    if not force and os.clock() - lastRadarSweep < 3 then return end 
+    lastRadarSweep = os.clock() 
+    for container in pairs(trackedContainers) do 
+        if not container.Parent then trackedContainers[container] = nil end 
+    end 
+    for coin in pairs(coinSet) do 
+        if not coin.Parent then unregisterCoin(coin) end 
+    end 
+    for _, containerParent in ipairs(workspace:GetChildren()) do 
+        local container = containerParent:FindFirstChild("CoinContainer") 
+        if container then watchContainer(container) end 
+        for _, child in ipairs(containerParent:GetChildren()) do 
+            if child ~= container and not trackedContainers[child] and string.find(child.Name, "Container", 1, true) then 
+                local part = child:FindFirstChildWhichIsA("BasePart") 
+                if part and string.find(part.Name, "Server", 1, true) then 
+                    watchContainer(child) 
+                end 
+            end 
+        end 
+    end 
+    for container in pairs(trackedContainers) do 
+        if container.Parent and not lenientContainers[container] then 
+            local hasKnown = false 
+            local hasParts = false 
+            for _, child in ipairs(container:GetChildren()) do 
+                if child:IsA("BasePart") then 
+                    hasParts = true 
+                    if string.find(child.Name, "Server", 1, true) then 
+                        hasKnown = true 
+                        break 
+                    end 
+                end 
+            end 
+            if hasParts and not hasKnown then 
+                lenientContainers[container] = true 
+                for _, child in ipairs(container:GetChildren()) do 
+                    registerCoin(child) 
+                end 
+            end 
+        end 
+    end 
+end 
+
+connect(workspace.ChildAdded, function(child) 
+    task.defer(radarSweep, true) 
+end) 
+radarSweep(true) 
+
+-- ================= AUTO PICKUP DETECTOR ================= --
+local lastAutoDetect = 0 
+local PICKUP_NAME_HINTS = { "coin", "candy", "token", "egg", "snow", "gift", "present", "pickup", "collect", "drop", "orb", "shell", "star", "gem" } 
+local PARENT_NAME_HINTS = { "container", "coin", "drop", "pickup", "spawn", "collect" } 
+
+local function nameHasHint(name, hints) 
+    local lower = string.lower(name) 
+    for _, hint in ipairs(hints) do 
+        if string.find(lower, hint, 1, true) then return true end 
+    end 
+    return false 
+end 
+
+local function autoDetectPickups() 
+    if os.clock() - lastAutoDetect < 5 then return end 
+    lastAutoDetect = os.clock() 
+    local groups = {} 
+    for _, mapCandidate in ipairs(workspace:GetChildren()) do 
+        if mapCandidate:IsA("Model") or mapCandidate:IsA("Folder") then 
+            for _, part in ipairs(mapCandidate:GetDescendants()) do 
+                if part:IsA("BasePart") and part.Anchored and not part.CanCollide and part.Size.Magnitude <= 8 then 
+                    local byName = groups[part.Parent] 
+                    if not byName then 
+                        byName = {} 
+                        groups[part.Parent] = byName 
+                    end 
+                    local info = byName[part.Name] 
+                    if info then 
+                        info.count += 1 
+                    else 
+                        byName[part.Name] = { count = 1, sample = part } 
+                    end 
+                end 
+            end 
+        end 
+    end 
+    local bestParent, bestName, bestScore, bestCount = nil, nil, 0, 0 
+    for parent, byName in pairs(groups) do 
+        for name, info in pairs(byName) do 
+            if info.count >= 5 then 
+                local sample = info.sample 
+                local score = 0 
+                if sample:FindFirstChildOfClass("TouchTransmitter") then score += 4 end 
+                if nameHasHint(name, PICKUP_NAME_HINTS) then score += 2 end 
+                if nameHasHint(parent.Name, PARENT_NAME_HINTS) then score += 2 end 
+                if sample:IsA("MeshPart") or sample:FindFirstChildOfClass("SpecialMesh") then score += 1 end 
+                if info.count <= 80 then score += 1 end 
+                if score >= 4 and (score > bestScore or (score == bestScore and info.count > bestCount)) then 
+                    bestParent, bestName, bestScore, bestCount = parent, name, score, info.count 
+                end 
+            end 
+        end 
+    end 
+    if bestParent then 
+        detectedPickupNames[bestName] = true 
+        watchContainer(bestParent) 
+        for _, part in ipairs(bestParent:GetChildren()) do 
+            registerCoin(part) 
+        end 
+        print(string.format("[MM2 AUTOFARM] auto-detected pickup: %s x%d in %s (score %d)", bestName, bestCount, bestParent:GetFullName(), bestScore)) 
+    end 
+end 
+
+local CLUSTER_RADIUS = 24 
+local CLUSTER_BONUS = 7 
+local lastPickTime = -math.huge 
+local lastPickCoin = nil 
+local lastPickScore = math.huge 
+local lastPickHadResult = false 
+
+local function findClosestItem(rootPart) 
+    local now = os.clock() 
+    if now - lastPickTime < 0.15 then 
+        if not lastPickHadResult then return nil, math.huge, math.huge end 
+        local cached = lastPickCoin 
+        if cached and cached.Parent and not coinBlacklist[cached] and not deadCoins[cached] then 
+            return cached, (cached.Position - rootPart.Position).Magnitude, lastPickScore 
+        end 
+    end 
+    lastPickTime = now 
+    for coin, timestamp in pairs(coinBlacklist) do 
+        if not coin.Parent or now - timestamp > 1.5 then coinBlacklist[coin] = nil end 
+    end 
+    radarSweep(false) 
+    local candidates = {} 
+    for coin in pairs(coinSet) do 
+        if coin.Parent and not coinBlacklist[coin] and not deadCoins[coin] then 
+            local childCount = #coin:GetChildren() 
+            if childCount > 0 then 
+                coinHadVisual[coin] = true 
+                table.insert(candidates, coin) 
+            elseif not coinHadVisual[coin] then 
+                table.insert(candidates, coin) 
+            end 
+        end 
+    end 
+    local count = #candidates 
+    local rootPosition = rootPart.Position 
+    local positions = table.create(count) 
+    local distances = table.create(count) 
+    local order = table.create(count) 
+    for index = 1, count do 
+        local position = candidates[index].Position 
+        positions[index] = position 
+        distances[index] = (position - rootPosition).Magnitude 
+        order[index] = index 
+    end 
+    table.sort(order, function(a, b) return distances[a] < distances[b] end) 
+    local best, bestDistance, bestScore = nil, math.huge, math.huge 
+    local maxBonus = 6 * CLUSTER_BONUS 
+    for _, index in ipairs(order) do 
+        local distance = distances[index] 
+        if distance - maxBonus >= bestScore then break end 
+        local position = positions[index] 
+        local neighbors = 0 
+        for otherIndex = 1, count do 
+            if otherIndex ~= index and (positions[otherIndex] - position).Magnitude <= CLUSTER_RADIUS then 
+                neighbors += 1 
+                if neighbors >= 6 then break end 
+            end 
+        end 
+        local score = distance - neighbors * CLUSTER_BONUS 
+        if score < bestScore then 
+            best = candidates[index] 
+            bestDistance = distance 
+            bestScore = score 
+        end 
+    end 
+    lastPickCoin = best 
+    lastPickScore = bestScore 
+    lastPickHadResult = best ~= nil 
+    return best, bestDistance, bestScore 
+end 
+
+local function isRoundOver() 
+    for _, guiName in ipairs({ "Scoreboard", "Scoreboard_Phone" }) do 
+        local scoreboard = guiParent:FindFirstChild(guiName) 
+        if scoreboard and scoreboard:IsA("ScreenGui") and scoreboard.Enabled then 
+            for _, modeFrame in ipairs(scoreboard:GetChildren()) do 
+                if modeFrame:IsA("GuiObject") and modeFrame.Visible then return true end 
+            end 
+        end 
+    end 
+    return false 
+end 
+
+farmConnection = RunService.Heartbeat:Connect(function(deltaTime) 
+    if not state.alive then return end 
+    if not state.autofarm then 
+        state.farmPaused = false 
+        state.pauseReason = "" 
+        return 
+    end 
+    local character = player.Character 
+    if not character then 
+        state.farmPaused = true 
+        state.pauseReason = "RESPAWN" 
+        return 
+    end 
+    local rootPart = character:FindFirstChild("HumanoidRootPart") 
+    local humanoid = character:FindFirstChildOfClass("Humanoid") 
+    if not rootPart or not humanoid or humanoid.Health <= 0 then 
+        state.farmPaused = true 
+        state.pauseReason = "RESPAWN" 
+        return 
+    end 
+    if isRoundOver() then 
+        currentTarget = nil 
+        state.farmPaused = true 
+        state.pauseReason = "ROUND END" 
+        restoreCharacter() 
+        rootPart.AssemblyLinearVelocity = Vector3.zero 
+        rootPart.AssemblyAngularVelocity = Vector3.zero 
+        return 
+    end 
+    if not currentTarget or not currentTarget.Parent or coinBlacklist[currentTarget] then 
+        local candidate, candidateDistance = findClosestItem(rootPart) 
+        if candidate and candidateDistance <= MAX_FARM_DISTANCE then 
+            currentTarget = candidate 
+            state.farmPaused = false 
+            state.pauseReason = "" 
+        else 
+            currentTarget = nil 
+            state.farmPaused = true 
+            state.pauseReason = candidate and "TOO FAR" or "WAITING" 
+            if not candidate then autoDetectPickups() end 
+        end 
+    end 
+    retargetAccumulator += deltaTime 
+    if currentTarget and retargetAccumulator >= 0.5 then 
+        retargetAccumulator = 0 
+        local candidate, candidateDistance, candidateScore = findClosestItem(rootPart) 
+        if candidate and candidate ~= currentTarget and candidateDistance <= MAX_FARM_DISTANCE then 
+            local currentDistance = (currentTarget.Position - rootPart.Position).Magnitude 
+            if currentDistance > 15 and candidateScore + 12 < currentDistance then 
+                currentTarget = candidate 
+            end 
+        end 
+    end 
+    local target = currentTarget 
+    if not target or not target.Parent then 
+        if not farmIdle then 
+            farmIdle = true 
+            restoreCharacter() 
+            rootPart.AssemblyLinearVelocity = Vector3.zero 
+            rootPart.AssemblyAngularVelocity = Vector3.zero 
+        end 
+        return 
+    end 
+    farmIdle = false 
+    local targetPosition = target.Position - Vector3.new(0, FLY_BELOW_OFFSET, 0) 
+    local offset = targetPosition - rootPart.Position 
+    local distance = offset.Magnitude 
+    if distance > MAX_FARM_DISTANCE then 
+        currentTarget = nil 
+        state.farmPaused = true 
+        state.pauseReason = "TOO FAR" 
+        restoreCharacter() 
+        rootPart.AssemblyLinearVelocity = Vector3.zero 
+        rootPart.AssemblyAngularVelocity = Vector3.zero 
+        return 
+    end 
+    state.farmPaused = false 
+    state.pauseReason = "" 
+    if player.DevCameraOcclusionMode ~= Enum.DevCameraOcclusionMode.Invisicam then 
+        pcall(function() player.DevCameraOcclusionMode = Enum.DevCameraOcclusionMode.Invisicam end) 
+    end 
+    for _, part in ipairs(character:GetDescendants()) do 
+        if part:IsA("BasePart") then 
+            if collisionCache[part] == nil then collisionCache[part] = part.CanCollide end 
+            part.CanCollide = false 
+        end 
+    end 
+    humanoid.PlatformStand = true 
+    rootPart.AssemblyLinearVelocity = Vector3.zero 
+    rootPart.AssemblyAngularVelocity = Vector3.zero 
+    if distance <= 0.45 then 
+        if fireTouch then 
+            pcall(fireTouch, rootPart, target, 0) 
+            pcall(fireTouch, rootPart, target, 1) 
+        end 
+        coinBlacklist[target] = os.clock() 
+        local bagFull = state.bagFound and state.bagLimit > 0 and state.bagCount >= state.bagLimit 
+        if not bagFull then 
+            coinTouchFails[target] = (coinTouchFails[target] or 0) + 1 
+            if coinTouchFails[target] >= 3 then deadCoins[target] = true end 
+        end 
+        currentTarget = nil 
+        return 
+    end 
+    if distance <= 0.001 then return end 
+    local safeDelta = math.min(deltaTime, 1 / 30) 
+    local step = math.min(state.farmSpeed * safeDelta, math.max(distance - 0.1, 0)) 
+    local nextPosition = rootPart.Position + offset.Unit * step 
+    local flatOffset = Vector3.new(offset.X, 0, offset.Z) 
+    if flatOffset.Magnitude > 0.05 then 
+        rootPart.CFrame = CFrame.lookAt(nextPosition, nextPosition + flatOffset.Unit) * CFrame.Angles(-math.pi / 2, 0, 0) 
+    else 
+        rootPart.CFrame = rootPart.CFrame.Rotation + nextPosition 
+    end 
+end) 
+
+-- ================= ANTI FLING / ANTI VOID ================= --
+local lastSafePosition = nil 
+local lastFramePosition = nil 
+local safePosAccumulator = 0 
+local voidThreshold = -440 
+do 
+    local ok, destroyHeight = pcall(function() return workspace.FallenPartsDestroyHeight end) 
+    if ok and typeof(destroyHeight) == "number" then voidThreshold = destroyHeight + 80 end 
+end 
+
+connect(RunService.Heartbeat, function(deltaTime) 
+    if not state.alive or not state.protection then return end 
+    local character = player.Character 
+    local rootPart = character and character:FindFirstChild("HumanoidRootPart") 
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid") 
+    if not rootPart or not humanoid or humanoid.Health <= 0 then return end 
+    local farmingActively = state.autofarm and not state.farmPaused 
+    local velocity = rootPart.AssemblyLinearVelocity 
+    local horizontalSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude 
+    local flingLimit = farmingActively and 300 or 120 
+    if horizontalSpeed > flingLimit or velocity.Y > 150 or velocity.Y < -260 or rootPart.AssemblyAngularVelocity.Magnitude > 60 then 
+        rootPart.AssemblyLinearVelocity = Vector3.zero 
+        rootPart.AssemblyAngularVelocity = Vector3.zero 
+        if lastFramePosition then rootPart.CFrame = rootPart.CFrame.Rotation + lastFramePosition end 
+    end 
+    if lastFramePosition and (rootPart.Position - lastFramePosition).Magnitude > 120 then 
+        lastFramePosition = rootPart.Position 
+        lastSafePosition = nil 
+        safePosAccumulator = 0 
+    end 
+    local inVoid = rootPart.Position.Y < voidThreshold 
+    if inVoid and lastSafePosition and not farmingActively then 
+        rootPart.AssemblyLinearVelocity = Vector3.zero 
+        rootPart.AssemblyAngularVelocity = Vector3.zero 
+        rootPart.CFrame = CFrame.new(lastSafePosition + Vector3.new(0, 3, 0)) 
+    end 
+    safePosAccumulator += deltaTime 
+    if safePosAccumulator >= 0.5 then 
+        safePosAccumulator = 0 
+        if not humanoid.PlatformStand and humanoid.FloorMaterial ~= Enum.Material.Air and rootPart.AssemblyLinearVelocity.Magnitude < 60 then 
+            lastSafePosition = rootPart.Position 
+        end 
+    end 
+    lastFramePosition = rootPart.Position 
+end) 
+
+-- Anti AFK
+connect(player.Idled, function() 
+    pcall(function() 
+        VirtualUser:CaptureController() 
+        VirtualUser:ClickButton2(Vector2.new()) 
+    end) 
+end) 
+
+-- Root Layout
+local holder = create("Frame", { 
+    Name = "Holder", 
+    AnchorPoint = Vector2.new(0.5, 0.5), 
+    BackgroundTransparency = 1, 
+    Position = UDim2.fromScale(0.5, 0.5), 
+    Size = UDim2.fromOffset(WINDOW_WIDTH, WINDOW_HEIGHT), 
+}, screenGui) 
+
+local responsiveScale = create("UIScale", { Scale = 1 }, holder) 
+local statsScale = nil 
+
+local function isPhoneScreen() 
+    local camera = workspace.CurrentCamera 
+    if not camera then return false end 
+    return UserInputService.TouchEnabled and camera.ViewportSize.Y <= 620 
+end 
+
+local function updateScale() 
+    local camera = workspace.CurrentCamera 
+    if not camera then return end 
+    local viewport = camera.ViewportSize 
+    local scale = math.min((viewport.X - 28) / WINDOW_WIDTH, (viewport.Y - 28) / WINDOW_HEIGHT) 
+    local minScale = 0.58 
+    if isPhoneScreen() then 
+        scale = math.min(scale, (viewport.Y * 0.74) / WINDOW_HEIGHT) 
+        minScale = 0.4 
+    end 
+    responsiveScale.Scale = math.clamp(scale, minScale, 1) 
+    if statsScale then 
+        if isPhoneScreen() then 
+            statsScale.Scale = math.clamp((viewport.Y * 0.42) / 202, 0.55, 1) 
+        else 
+            statsScale.Scale = 1 
+        end 
+    end 
+end 
+
+local function clampWindow() 
+    local camera = workspace.CurrentCamera 
+    if not camera then return end 
+    local viewport = camera.ViewportSize 
+    local scale = responsiveScale.Scale 
+    local visibleHeight = (state.minimized and COLLAPSED_HEIGHT or WINDOW_HEIGHT) * scale 
+    local halfWidth = WINDOW_WIDTH * scale * 0.5 
+    local fullHalfHeight = WINDOW_HEIGHT * scale * 0.5 
+    local position = holder.Position 
+    local centerX = position.X.Scale * viewport.X + position.X.Offset 
+    local centerY = position.Y.Scale * viewport.Y + position.Y.Offset 
+    centerX = math.clamp(centerX, halfWidth + 8, math.max(halfWidth + 8, viewport.X - halfWidth - 8)) 
+    centerY = math.clamp(centerY, fullHalfHeight + 8, math.max(fullHalfHeight + 8, viewport.Y - visibleHeight + fullHalfHeight - 8)) 
+    holder.Position = UDim2.fromOffset(centerX, centerY) 
+end 
+
+local function refreshViewport() 
+    updateScale() 
+    clampWindow() 
+end 
+
+local function bindCamera() 
+    if cameraConnection then cameraConnection:Disconnect() end 
+    local camera = workspace.CurrentCamera 
+    if camera then 
+        cameraConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(refreshViewport) 
+    end 
+    refreshViewport() 
+end 
+
+connect(workspace:GetPropertyChangedSignal("CurrentCamera"), bindCamera) 
+bindCamera() 
+
+local SoundService = game:GetService("SoundService") 
+local function playUiSound(speed, volume) 
+    pcall(function() 
+        local sound = Instance.new("Sound") 
+        sound.SoundId = "rbxasset://sounds/button.wav" 
+        sound.PlaybackSpeed = speed or 1 
+        sound.Volume = volume or 0.6 
+        sound.PlayOnRemove = true 
+        sound.Parent = SoundService 
+        sound:Destroy() 
+    end) 
+end 
+
+local shadow = create("ImageLabel", { 
+    Name = "Shadow", 
+    BackgroundTransparency = 1, 
+    Image = "rbxassetid://1316045217", 
+    ImageColor3 = Color3.fromRGB(2, 6, 20), 
+    ImageTransparency = 1, 
+    Position = UDim2.fromOffset(-28, -20), 
+    ScaleType = Enum.ScaleType.Slice, 
+    SliceCenter = Rect.new(10, 10, 118, 118), 
+    Size = UDim2.fromOffset(WINDOW_WIDTH + 56, WINDOW_HEIGHT + 56), 
+    Visible = false, 
+    ZIndex = 0, 
+}, holder) 
+
+local window = create("CanvasGroup", { 
+    Name = "Window", 
+    BackgroundColor3 = Theme.Navy, 
+    BorderSizePixel = 0, 
+    ClipsDescendants = true, 
+    GroupTransparency = 1, 
+    Size = UDim2.fromOffset(WINDOW_WIDTH, WINDOW_HEIGHT), 
+    ZIndex = 1, 
+}, holder) 
+addCorner(window, 17) 
+
+local windowStroke = addStroke(window, Theme.OrangeNeon, 2.5, 0) 
+local borderGradient = addGradient(windowStroke, { 
+    { 0, Theme.OrangeBright }, 
+    { 0.14, Theme.OrangeNeon }, 
+    { 0.4, Theme.OrangeSoft }, 
+    { 1, Theme.OrangeSoft }, 
+}, 25) 
+
+borderGradient.Transparency = NumberSequence.new({ 
+    NumberSequenceKeypoint.new(0, 0), 
+    NumberSequenceKeypoint.new(0.1, 0.05), 
+    NumberSequenceKeypoint.new(0.3, 0.62), 
+    NumberSequenceKeypoint.new(0.6, 0.86), 
+    NumberSequenceKeypoint.new(1, 0.92), 
+}) 
+
+local background = create("Frame", { 
+    BackgroundColor3 = Color3.new(1, 1, 1), 
+    BorderSizePixel = 0, 
+    Size = UDim2.fromScale(1, 1), 
+    ZIndex = 1, 
+}, window) 
+addCorner(background, 16) 
+
+local backgroundGradient = addGradient(background, { 
+    { 0, Color3.fromRGB(16, 82, 137) }, 
+    { 0.48, Color3.fromRGB(12, 44, 92) }, 
+    { 0.78, Color3.fromRGB(48, 34, 104) }, 
+    { 1, Color3.fromRGB(12, 24, 62) }, 
+}, 125) 
+
+local sheen = create("Frame", { 
+    BackgroundColor3 = Color3.new(1, 1, 1), 
+    BackgroundTransparency = 0.96, 
+    BorderSizePixel = 0, 
+    Size = UDim2.fromScale(1, 1), 
+    ZIndex = 2, 
+}, window) 
+addCorner(sheen, 16) 
+
+create("UIGradient", { 
+    Color = ColorSequence.new(Color3.new(1, 1, 1)), 
+    Rotation = 90, 
+    Transparency = NumberSequence.new({ 
+        NumberSequenceKeypoint.new(0, 1), 
+        NumberSequenceKeypoint.new(0.35, 0.55), 
+        NumberSequenceKeypoint.new(0.5, 0.35), 
+        NumberSequenceKeypoint.new(0.65, 0.55), 
+        NumberSequenceKeypoint.new(1, 1), 
+    }), 
+}, sheen) 
+
+local topNeon = create("Frame", { 
+    AnchorPoint = Vector2.new(0.5, 0), 
+    BackgroundColor3 = Theme.OrangeNeon, 
+    BackgroundTransparency = 0.12, 
+    BorderSizePixel = 0, 
+    Position = UDim2.new(0.5, 0, 0, 63), 
+    Size = UDim2.new(1, -34, 0, 2), 
+    ZIndex = 6, 
+}, window) 
+addCorner(topNeon, 99) 
+
+local topNeonGradient = create("UIGradient", { 
+    Color = ColorSequence.new(Theme.OrangeNeon), 
+    Rotation = 0, 
+    Transparency = NumberSequence.new({ 
+        NumberSequenceKeypoint.new(0, 1), 
+        NumberSequenceKeypoint.new(0.16, 0.2), 
+        NumberSequenceKeypoint.new(0.5, 0), 
+        NumberSequenceKeypoint.new(0.84, 0.2), 
+        NumberSequenceKeypoint.new(1, 1), 
+    }), 
+}, topNeon) 
+
+local glow = create("Frame", { 
+    AnchorPoint = Vector2.new(0.5, 0.5), 
+    BackgroundColor3 = Theme.Cyan, 
+    BackgroundTransparency = 0.58, 
+    BorderSizePixel = 0, 
+    Position = UDim2.fromOffset(330, 95), 
+    Size = UDim2.fromOffset(230, 150), 
+    ZIndex = 2, 
+}, window) 
+addCorner(glow, 999) 
+addGradient(glow, { 
+    { 0, Theme.Cyan }, 
+    { 0.55, Theme.Aqua }, 
+    { 1, Theme.Blue }, 
+}, 25, NumberSequence.new({ 
+    NumberSequenceKeypoint.new(0, 0.2), 
+    NumberSequenceKeypoint.new(1, 0.85), 
+})) 
+
+local warmGlow = create("Frame", { 
+    AnchorPoint = Vector2.new(0.5, 0.5), 
+    BackgroundColor3 = Theme.Coral, 
+    BackgroundTransparency = 0.68, 
+    BorderSizePixel = 0, 
+    Position = UDim2.fromOffset(45, 330), 
+    Size = UDim2.fromOffset(210, 145), 
+    ZIndex = 2, 
+}, window) 
+addCorner(warmGlow, 999) 
+addGradient(warmGlow, { 
+    { 0, Theme.Coral }, 
+    { 0.5, Theme.Gold }, 
+    { 1, Theme.Orange }, 
+}, -30, NumberSequence.new({ 
+    NumberSequenceKeypoint.new(0, 0.35), 
+    NumberSequenceKeypoint.new(1, 0.9), 
+})) 
+
+local glints = {} 
+local glintPositions = { 
+    { 34, 92, Theme.Cyan, 0.2 }, 
+    { 326, 142, Theme.Gold, 1.1 }, 
+    { 54, 214, Theme.Coral, 2.0 }, 
+    { 312, 278, Theme.Cyan, 2.8 }, 
+    { 94, 360, Theme.Gold, 3.7 }, 
+    { 286, 350, Theme.Coral, 4.4 }, 
+} 
+
+for index, info in ipairs(glintPositions) do 
+    local glint = create("Frame", { 
+        Name = "Glint" .. index, 
+        AnchorPoint = Vector2.new(0.5, 0.5), 
+        BackgroundTransparency = 1, 
+        Position = UDim2.fromOffset(info[1], info[2]), 
+        Size = UDim2.fromOffset(10, 10), 
+        ZIndex = 3, 
+    }, window) 
+    local vertical = create("Frame", { 
+        AnchorPoint = Vector2.new(0.5, 0.5), 
+        BackgroundColor3 = info[3], 
+        BackgroundTransparency = 0.35, 
+        BorderSizePixel = 0, 
+        Position = UDim2.fromScale(0.5, 0.5), 
+        Size = UDim2.fromOffset(2, 10), 
+        ZIndex = 3, 
+    }, glint) 
+    addCorner(vertical, 99) 
+    local horizontal = create("Frame", { 
+        AnchorPoint = Vector2.new(0.5, 0.5), 
+        BackgroundColor3 = info[3], 
+        BackgroundTransparency = 0.35, 
+        BorderSizePixel = 0, 
+        Position = UDim2.fromScale(0.5, 0.5), 
+        Size = UDim2.fromOffset(10, 2), 
+        ZIndex = 3, 
+    }, glint) 
+    addCorner(horizontal, 99) 
+    table.insert(glints, { 
+        object = glint, 
+        vertical = vertical, 
+        horizontal = horizontal, 
+        baseX = info[1], 
+        baseY = info[2], 
+        phase = info[4], 
+    }) 
+end 
+
+local header = create("Frame", { 
+    Name = "Header", 
+    Active = true, 
+    BackgroundTransparency = 1, 
+    Position = UDim2.fromOffset(16, 10), 
+    Size = UDim2.new(1, -32, 0, 50), 
+    ZIndex = 20, 
+}, window) 
+
+local sunGlowOuter = create("Frame", { 
+    AnchorPoint = Vector2.new(0.5, 0.5), 
+    BackgroundColor3 = Theme.Gold, 
+    BackgroundTransparency = 0.86, 
+    BorderSizePixel = 0, 
+    Position = UDim2.fromOffset(16, 25), 
+    Size = UDim2.fromOffset(38, 38), 
+    ZIndex = 20, 
+}, header) 
+addCorner(sunGlowOuter, 99) 
+
+local sunGlowInner = create("Frame", { 
+    AnchorPoint = Vector2.new(0.5, 0.5), 
+    BackgroundColor3 = Theme.Orange, 
+    BackgroundTransparency = 0.7, 
+    BorderSizePixel = 0, 
+    Position = UDim2.fromOffset(16, 25), 
+    Size = UDim2.fromOffset(28, 28), 
+    ZIndex = 21, 
+}, header) 
+addCorner(sunGlowInner, 99) 
+
+local sun = create("Frame", { 
+    AnchorPoint = Vector2.new(0.5, 0.5), 
+    BackgroundColor3 = Theme.Gold, 
+    BackgroundTransparency = 0, 
+    BorderSizePixel = 0, 
+    Position = UDim2.fromOffset(16, 25), 
+    Size = UDim2.fromOffset(18, 18), 
+    ZIndex = 22, 
+}, header) 
+addCorner(sun, 99) 
+addGradient(sun, { 
+    { 0, Theme.Gold }, 
+    { 1, Theme.Orange }, 
+}, 45) 
+
+local sunRays = {} 
+for rayIndex = 1, 12 do 
+    local angle = math.rad((rayIndex - 1) * 30) 
+    local isLong = rayIndex % 2 == 1 
+    local ray = create("Frame", { 
+        AnchorPoint = Vector2.new(0.5, 0.5), 
+        BackgroundColor3 = isLong and Theme.Gold or Theme.Orange, 
+        BackgroundTransparency = 0.04, 
+        BorderSizePixel = 0, 
+        Position = UDim2.fromScale( 
+            0.5 + math.cos(angle) * (isLong and 1.05 or 0.88), 
+            0.5 + math.sin(angle) * (isLong and 1.05 or 0.88) 
+        ), 
+        Rotation = (rayIndex - 1) * 30, 
+        Size = isLong and UDim2.fromOffset(8, 2) or UDim2.fromOffset(5, 2), 
+        ZIndex = 21, 
+    }, sun) 
+    addCorner(ray, 99) 
+    table.insert(sunRays, ray) 
+end 
+
+local sunCore = create("Frame", { 
+    AnchorPoint = Vector2.new(0.5, 0.5), 
+    BackgroundColor3 = Color3.fromRGB(255, 244, 214), 
+    BorderSizePixel = 0, 
+    Position = UDim2.fromScale(0.5, 0.5), 
+    Size = UDim2.fromOffset(8, 8), 
+    ZIndex = 23, 
+}, sun) 
+addCorner(sunCore, 99) 
+
+create("TextLabel", { 
+    BackgroundTransparency = 1, 
+    Font = Enum.Font.GothamBold, 
+    Position = UDim2.fromOffset(38, 6), 
+    Size = UDim2.fromOffset(180, 28), 
+    RichText = true, 
+    Text = '<font color="#2CE2DE">MM2 SUMMER</font> <font color="#FFD663">AUTOFARM</font>', 
+    TextSize = 14, 
+    TextStrokeColor3 = Theme.Aqua, 
+    TextStrokeTransparency = 0.48, 
+    TextXAlignment = Enum.TextXAlignment.Left, 
+    ZIndex = 22, 
+}, header) 
+
+create("TextLabel", { 
+    BackgroundTransparency = 1, 
+    Font = Enum.Font.GothamBold, 
+    Position = UDim2.fromOffset(38, 37), 
+    Size = UDim2.fromOffset(28, 14), 
+    Text = "v1.2", 
+    TextColor3 = Theme.Muted, 
+    TextSize = 9, 
+    TextTransparency = 0.2, 
+    TextXAlignment = Enum.TextXAlignment.Left, 
+    ZIndex = 22, 
+}, header) 
+
+local function makeHeaderButton(name, text, offset, accent) 
+    local button = create("TextButton", { 
+        Name = name, 
+        AnchorPoint = Vector2.new(1, 0.5), 
+        AutoButtonColor = false, 
+        BackgroundColor3 = Theme.Card, 
+        BackgroundTransparency = 0.18, 
+        BorderSizePixel = 0, 
+        Font = Enum.Font.GothamBold, 
+        Position = UDim2.new(1, offset, 0.5, 0), 
+        Size = UDim2.fromOffset(36, 36), 
+        Text = text, 
+        TextColor3 = Theme.White, 
+        TextSize = 20, 
+        ZIndex = 24, 
+    }, header) 
+    addCorner(button, 99) 
+    local outline = addStroke(button, accent, 1, 0.48) 
+
+    connect(button.MouseEnter, function() 
+        smoothTween(button, 0.3, { BackgroundColor3 = accent, BackgroundTransparency = 0.14 }) 
+        smoothTween(outline, 0.3, { Transparency = 0.08 }) 
+    end) 
+    connect(button.MouseLeave, function() 
+        smoothTween(button, 0.35, { BackgroundColor3 = Theme.Card, BackgroundTransparency = 0.18, Size = UDim2.fromOffset(36, 36) }) 
+        smoothTween(outline, 0.35, { Transparency = 0.48 }) 
+    end) 
+    connect(button.MouseButton1Down, function() 
+        smoothTween(button, 0.12, { Size = UDim2.fromOffset(33, 33) }) 
+    end) 
+    connect(button.MouseButton1Up, function() 
+        smoothTween(button, 0.26, { Size = UDim2.fromOffset(36, 36) }, Enum.EasingStyle.Back) 
+    end) 
+    connect(button.Activated, function() 
+        playUiSound(1.2, 0.7) 
+    end) 
+    return button 
+end 
+
+local closeButton = makeHeaderButton("Close", "×", 0, Theme.Coral) 
+local minimizeButton = makeHeaderButton("Minimize", "—", -42, Theme.Cyan) 
+
+local content = create("Frame", { 
+    Name = "Content", 
+    BackgroundTransparency = 1, 
+    Position = UDim2.fromOffset(15, 70), 
+    Size = UDim2.new(1, -30, 1, -85), 
+    ZIndex = 10, 
+}, window) 
+
+local function makeCard(name, y, height) 
+    local card = create("Frame", { 
+        Name = name, 
+        BackgroundColor3 = Theme.Card, 
+        BackgroundTransparency = 0.04, 
+        BorderSizePixel = 0, 
+        ClipsDescendants = true, 
+        Position = UDim2.fromOffset(0, y), 
+        Size = UDim2.new(1, 0, 0, height), 
+        ZIndex = 10, 
+    }, content) 
+    addCorner(card, 10) 
+    local outline = addStroke(card, Theme.Aqua, 1.5, 0.18) 
+    addGradient(card, { 
+        { 0, Color3.fromRGB(38, 111, 158) }, 
+        { 0.58, Color3.fromRGB(20, 65, 112) }, 
+        { 1, Color3.fromRGB(73, 49, 126) }, 
+    }, 10) 
+    return card, outline 
+end 
+
+local glowBars = {} 
+local function addOrangeFade(frame, centerTransparency) 
+    return create("UIGradient", { 
+        Color = ColorSequence.new(Theme.OrangeNeon), 
+        Rotation = 90, 
+        Transparency = NumberSequence.new({ 
+            NumberSequenceKeypoint.new(0, 1), 
+            NumberSequenceKeypoint.new(0.16, 0.72), 
+            NumberSequenceKeypoint.new(0.5, centerTransparency), 
+            NumberSequenceKeypoint.new(0.84, 0.72), 
+            NumberSequenceKeypoint.new(1, 1), 
+        }), 
+    }, frame) 
+end 
+
+local function addGlowBar(parent, y, height) 
+    local x = 12 
+    local auraWide = create("Frame", { 
+        BackgroundColor3 = Theme.OrangeNeon, 
+        BackgroundTransparency = 0.95, 
+        BorderSizePixel = 0, 
+        Position = UDim2.fromOffset(x - 9, y - 18), 
+        Size = UDim2.fromOffset(20, height + 36), 
+        ZIndex = 10, 
+    }, parent) 
+    addCorner(auraWide, 99) 
+    addOrangeFade(auraWide, 0.34) 
+
+    local auraMid = create("Frame", { 
+        BackgroundColor3 = Theme.OrangeNeon, 
+        BackgroundTransparency = 0.82, 
+        BorderSizePixel = 0, 
+        Position = UDim2.fromOffset(x - 5, y - 10), 
+        Size = UDim2.fromOffset(12, height + 20), 
+        ZIndex = 11, 
+    }, parent) 
+    addCorner(auraMid, 99) 
+    addOrangeFade(auraMid, 0.16) 
+
+    local auraNear = create("Frame", { 
+        BackgroundColor3 = Theme.OrangeNeon, 
+        BackgroundTransparency = 0.58, 
+        BorderSizePixel = 0, 
+        Position = UDim2.fromOffset(x - 2, y - 4), 
+        Size = UDim2.fromOffset(6, height + 8), 
+        ZIndex = 12, 
+    }, parent) 
+    addCorner(auraNear, 99) 
+    addOrangeFade(auraNear, 0.02) 
+
+    local core = create("Frame", { 
+        BackgroundColor3 = Theme.OrangeNeon, 
+        BackgroundTransparency = 0, 
+        BorderSizePixel = 0, 
+        Position = UDim2.fromOffset(x, y), 
+        Size = UDim2.fromOffset(2, height), 
+        ZIndex = 14, 
+    }, parent) 
+    addCorner(core, 99) 
+    local coreGradient = create("UIGradient", { 
+        Color = ColorSequence.new(Theme.OrangeNeon), 
+        Rotation = 90, 
+        Transparency = NumberSequence.new({ 
+            NumberSequenceKeypoint.new(0, 0.72), 
+            NumberSequenceKeypoint.new(0.15, 0.1), 
+            NumberSequenceKeypoint.new(0.5, 0), 
+            NumberSequenceKeypoint.new(0.85, 0.1), 
+            NumberSequenceKeypoint.new(1, 0.72), 
+        }), 
+    }, core) 
+
+    local sharp = create("Frame", { 
+        BackgroundColor3 = Theme.OrangeBright, 
+        BackgroundTransparency = 0.24, 
+        BorderSizePixel = 0, 
+        Position = UDim2.fromOffset(x + 1, y + 3), 
+        Size = UDim2.fromOffset(1, math.max(8, height - 6)), 
+        ZIndex = 15, 
+    }, parent) 
+    addCorner(sharp, 99) 
+
+    create("UIGradient", { 
+        Color = ColorSequence.new(Theme.OrangeBright), 
+        Rotation = 90, 
+        Transparency = NumberSequence.new({ 
+            NumberSequenceKeypoint.new(0, 1), 
+            NumberSequenceKeypoint.new(0.22, 0.32), 
+            NumberSequenceKeypoint.new(0.5, 0.08), 
+            NumberSequenceKeypoint.new(0.78, 0.32), 
+            NumberSequenceKeypoint.new(1, 1), 
+        }), 
+    }, sharp) 
+
+    table.insert(glowBars, { 
+        auraWide = auraWide, 
+        auraMid = auraMid, 
+        auraNear = auraNear, 
+        core = core, 
+        sharp = sharp, 
+        gradient = coreGradient, 
+        phase = #glowBars * 1.1, 
+    }) 
+    return core 
+end 
+
+local authorCard = makeCard("Author", 0, 48) 
+addGlowBar(authorCard, 8, 32, Theme.Gold, Theme.Orange) 
+create("TextLabel", { 
+    BackgroundTransparency = 1, 
+    Font = Enum.Font.GothamSemibold, 
+    Position = UDim2.fromOffset(29, 0), 
+    Size = UDim2.new(1, -45, 1, 0), 
+    Text = "made by skobliko", 
+    TextColor3 = Theme.White, 
+    TextSize = 15, 
+    TextXAlignment = Enum.TextXAlignment.Left, 
+    ZIndex = 13, 
+}, authorCard) 
+
+local function makeToggleCard(y, title, subtitle, colorA, colorB, callback) 
+    local card, outline = makeCard(title, y, 50) 
+    addGlowBar(card, 10, 30, colorA, colorB) 
+    local hitbox = create("TextButton", { 
+        AutoButtonColor = false, 
+        BackgroundTransparency = 1, 
+        Size = UDim2.fromScale(1, 1), 
+        Text = "", 
+        ZIndex = 18, 
+    }, card) 
+    local icon = create("Frame", { 
+        AnchorPoint = Vector2.new(1, 0.5), 
+        BackgroundColor3 = Theme.NavySoft, 
+        BackgroundTransparency = 0.12, 
+        BorderSizePixel = 0, 
+        Position = UDim2.new(1, -16, 0.5, 0), 
+        Size = UDim2.fromOffset(28, 28), 
+        ZIndex = 15, 
+    }, card) 
+    addCorner(icon, 12) 
+
+    local iconCore = create("Frame", { 
+        AnchorPoint = Vector2.new(0.5, 0.5), 
+        BackgroundColor3 = colorB, 
+        BorderSizePixel = 0, 
+        Position = UDim2.fromScale(0.5, 0.5), 
+        Size = UDim2.fromOffset(10, 10), 
+        ZIndex = 14, 
+    }, icon) 
+    addCorner(iconCore, 99) 
+    local iconGlow = addStroke(iconCore, colorA, 4, 0.72) 
+
+    create("TextLabel", { 
+        BackgroundTransparency = 1, 
+        Font = Enum.Font.GothamBold, 
+        Position = UDim2.fromOffset(28, 15), 
+        Size = UDim2.new(1, -82, 0, 20), 
+        Text = title, 
+        TextColor3 = Theme.White, 
+        TextSize = 14, 
+        TextXAlignment = Enum.TextXAlignment.Left, 
+        ZIndex = 14, 
+    }, card) 
+
+    local stateText = create("TextLabel", { 
+        AnchorPoint = Vector2.new(1, 0.5), 
+        BackgroundTransparency = 1, 
+        Font = Enum.Font.GothamBold, 
+        Position = UDim2.new(1, -68, 0.5, 0), 
+        Size = UDim2.fromOffset(42, 18), 
+        Text = "", 
+        TextColor3 = Theme.Muted, 
+        TextSize = 9, 
+        TextTransparency = 0.12, 
+        TextXAlignment = Enum.TextXAlignment.Right, 
+        ZIndex = 15, 
+    }, card) 
+
+    local track = create("Frame", { 
+        AnchorPoint = Vector2.new(1, 0.5), 
+        BackgroundColor3 = Theme.Dim, 
+        BackgroundTransparency = 1, 
+        BorderSizePixel = 0, 
+        Position = UDim2.new(1, -16, 0.5, 0), 
+        Size = UDim2.fromOffset(1, 1), 
+        Visible = false, 
+        ZIndex = 14, 
+    }, card) 
+    addCorner(track, 99) 
+    local trackStroke = addStroke(track, colorA, 1.5, 0.62) 
+
+    local knob = create("Frame", { 
+        AnchorPoint = Vector2.new(0.5, 0.5), 
+        BackgroundColor3 = Theme.White, 
+        BorderSizePixel = 0, 
+        Position = UDim2.new(0, 12, 0.5, 0), 
+        Size = UDim2.fromOffset(18, 18), 
+        ZIndex = 15, 
+    }, track) 
+    addCorner(knob, 99) 
+    local knobStroke = addStroke(knob, colorA, 2, 0.7) 
+
+    local value = false 
+    local function setValue(nextValue) 
+        value = nextValue == true 
+        stateText.Text = value and "ON" or "OFF" 
+        stateText.TextColor3 = value and colorA or Theme.Dim 
+        smoothTween(track, 0.38, { BackgroundColor3 = value and colorA or Theme.Dim, BackgroundTransparency = value and 0.08 or 0.48 }, Enum.EasingStyle.Quart) 
+        smoothTween(trackStroke, 0.34, { Color = value and colorB or colorA, Transparency = value and 0.08 or 0.62 }) 
+        smoothTween(knob, 0.42, { Position = value and UDim2.new(1, -12, 0.5, 0) or UDim2.new(0, 12, 0.5, 0), Size = value and UDim2.fromOffset(19, 19) or UDim2.fromOffset(18, 18) }, Enum.EasingStyle.Quart) 
+        smoothTween(knobStroke, 0.34, { Color = value and colorB or colorA, Transparency = value and 0.18 or 0.7 }) 
+        smoothTween(iconCore, 0.35, { BackgroundColor3 = value and colorA or colorB, Size = value and UDim2.fromOffset(15, 15) or UDim2.fromOffset(12, 12) }) 
+        smoothTween(iconGlow, 0.35, { Color = value and colorA or colorB, Transparency = value and 0.42 or 0.72 }) 
+        smoothTween(icon, 0.3, { BackgroundColor3 = value and colorA or Theme.NavySoft, BackgroundTransparency = value and 0.68 or 0.12 }) 
+        callback(value) 
+    end 
+
+    connect(hitbox.Activated, function() 
+        setValue(not value) 
+        playUiSound(value and 1.25 or 0.85, 0.8) 
+        smoothTween(icon, 0.12, { Size = UDim2.fromOffset(24, 24) }) 
+        task.delay(0.12, function() 
+            if icon.Parent then 
+                smoothTween(icon, 0.32, { Size = UDim2.fromOffset(28, 28) }, Enum.EasingStyle.Back) 
+            end 
+        end) 
+    end) 
+    connect(hitbox.MouseEnter, function() 
+        smoothTween(card, 0.35, { BackgroundColor3 = Theme.CardHover, BackgroundTransparency = 0.02 }) 
+        smoothTween(outline, 0.35, { Transparency = 0.08 }) 
+    end) 
+    connect(hitbox.MouseLeave, function() 
+        smoothTween(card, 0.4, { BackgroundColor3 = Theme.Card, BackgroundTransparency = 0.04 }) 
+        smoothTween(outline, 0.4, { Transparency = 0.18 }) 
+    end) 
+    return setValue 
+end 
+
+local setAutofarmEnabled = makeToggleCard(58, "Auto Farm", "", Theme.Cyan, Theme.Coral, function(enabled) 
+    state.autofarm = enabled 
+    if not enabled then 
+        currentTarget = nil 
+        restoreCharacter() 
+    end 
+end) 
+
+local bagKillTriggered = false 
+local bagStartFarmed = state.farmed 
+local bagCheckEnabledAt = 0 
+local bagFullConfirmations = 0 
+
+-- ================= INTERFACE BAG SCANNER ================= --
+local trackedBagLabel = nil 
+local lastBagScan = 0 
+
+local function labelContext(object) 
+    local parts = { object.Name } 
+    local ancestor = object.Parent 
+    for _ = 1, 6 do 
+        if not ancestor then break end 
+        table.insert(parts, ancestor.Name) 
+        ancestor = ancestor.Parent 
+    end 
+    return string.lower(table.concat(parts, " ")) 
+end 
+
+local function parseBagText(object) 
+    if not (object:IsA("TextLabel") or object:IsA("TextButton")) then return nil end 
+    local text = object.Text or "" 
+    text = string.gsub(text, "<[^<>]->", "") 
+    text = string.gsub(text, ",", "") 
+    local currentText, capacityText = string.match(text, "^%s*(%d+)%s*/%s*(%d+)%s*$") 
+    if currentText then return tonumber(currentText), tonumber(capacityText) end 
+    local plain = string.match(text, "^%s*(%d+)%s*$") 
+    if plain then return tonumber(plain), nil end 
+    return nil 
+end 
+
+local trackedBagContainer = nil 
+local lastDeepContainerScan = 0 
+
+local function findCoinBagContainer(playerGui) 
+    if trackedBagContainer and trackedBagContainer.Parent then return trackedBagContainer end 
+    trackedBagContainer = nil 
+    local mainGui = playerGui:FindFirstChild("MainGUI") 
+    local gameFrame = mainGui and mainGui:FindFirstChild("Game") 
+    local coinBags = gameFrame and gameFrame:FindFirstChild("CoinBags") 
+    local container = coinBags and coinBags:FindFirstChild("Container") 
+    if container then 
+        trackedBagContainer = container 
+        return container 
+    end 
+    if os.clock() - lastDeepContainerScan < 1.5 then return nil end 
+    lastDeepContainerScan = os.clock() 
+    for _, object in ipairs(playerGui:GetDescendants()) do 
+        if object.Name == "CoinBags" then 
+            local found = object:FindFirstChild("Container") or object 
+            trackedBagContainer = found 
+            return found 
+        end 
+    end 
+    return nil 
+end 
+
+local function findCoinBagLabel(playerGui) 
+    local container = findCoinBagContainer(playerGui) 
+    if not container then return nil end 
+    local fallbackLabel = nil 
+    for _, bag in ipairs(container:GetChildren()) do 
+        if bag:IsA("GuiObject") then 
+            local currencyFrame = bag:FindFirstChild("CurrencyFrame") 
+            local icon = currencyFrame and currencyFrame:FindFirstChild("Icon") 
+            local label = icon and icon:FindFirstChild("Coins") 
+            if not label then label = bag:FindFirstChild("Coins", true) end 
+            if label and label:IsA("TextLabel") then 
+                if bag.Visible then return label end 
+                if bag.Name == "Coin" or not fallbackLabel then fallbackLabel = label end 
+            end 
+        end 
+    end 
+    return fallbackLabel 
+end 
+
+local function bagShowsFull(label) 
+    local icon = label and label.Parent 
+    local currencyFrame = icon and icon.Parent 
+    local bag = currencyFrame and currencyFrame.Parent 
+    local fullLabel = bag and bag:FindFirstChild("Full") 
+    if fullLabel and fullLabel:IsA("TextLabel") then return fullLabel.Visible end 
+    return false 
+end 
+
+local announcedBagPath = nil 
+local function announceBagLabel(label) 
+    local path = label:GetFullName() 
+    if path ~= announcedBagPath then 
+        announcedBagPath = path 
+        print("[MM2 AUTOFARM] coin counter found:", path) 
+    end 
+end 
+
+local function scanBagFromInterface() 
+    if trackedBagLabel and trackedBagLabel.Parent then 
+        local current, capacity = parseBagText(trackedBagLabel) 
+        if current then return current, capacity end 
+    end 
+    trackedBagLabel = nil 
+    local playerGui = player:FindFirstChild("PlayerGui") 
+    if not playerGui then return nil end 
+    local exactLabel = findCoinBagLabel(playerGui) 
+    if exactLabel then 
+        local current, capacity = parseBagText(exactLabel) 
+        if current then 
+            trackedBagLabel = exactLabel 
+            announceBagLabel(exactLabel) 
+            return current, capacity 
+        end 
+    end 
+    if os.clock() - lastBagScan < 1.5 then return nil end 
+    lastBagScan = os.clock() 
+    local bestLabel, bestCurrent, bestCapacity, bestScore = nil, nil, nil, 0 
+    for _, object in ipairs(playerGui:GetDescendants()) do 
+        local current, capacity = parseBagText(object) 
+        if current and object.Visible then 
+            local context = labelContext(object) 
+            local score = 0 
+            if string.find(context, "coin", 1, true) then score += 4 end 
+            if string.find(context, "bag", 1, true) then score += 3 end 
+            if string.find(context, "candy", 1, true) then score += 2 end 
+            if string.find(context, "currency", 1, true) then score += 1 end 
+            if object.Name == "Coins" then score += 4 end 
+            if capacity == BAG_LIMIT_DEFAULT or capacity == BAG_LIMIT_ELITE then score += 5 end 
+            if (capacity or score >= 3) and score > bestScore then 
+                bestLabel = object 
+                bestCurrent = current 
+                bestCapacity = capacity 
+                bestScore = score 
+            end 
+        end 
+    end 
+    if bestLabel then 
+        trackedBagLabel = bestLabel 
+        announceBagLabel(bestLabel) 
+        return bestCurrent, bestCapacity 
+    end 
+    return nil 
+end 
+
+local lastSeenBagCount = nil 
+local lastBagMissWarn = 0 
+
+local function updateBagFromInterface() 
+    local current, capacity = scanBagFromInterface() 
+    if current then 
+        if lastSeenBagCount ~= nil and current > lastSeenBagCount then 
+            state.farmed += current - lastSeenBagCount 
+        end 
+        lastSeenBagCount = current 
+        state.bagFound = true 
+        state.bagCount = current 
+        if capacity == BAG_LIMIT_DEFAULT or capacity == BAG_LIMIT_ELITE then 
+            state.bagLimit = capacity 
+        end 
+        if bagShowsFull(trackedBagLabel) then 
+            state.bagCount = math.max(state.bagCount, state.bagLimit) 
+        end 
+    else 
+        state.bagFound = false 
+        state.bagCount = math.max(0, state.farmed - bagStartFarmed) 
+        if os.clock() - lastBagMissWarn >= 5 then 
+            lastBagMissWarn = os.clock() 
+            warn("[MM2 AUTOFARM] coin counter GUI not found (open F9 console and share this log)") 
+        end 
+    end 
+end 
+
+task.spawn(function() 
+    local ok, ownsElite = pcall(function() 
+        return MarketplaceService:UserOwnsGamePassAsync(player.UserId, ELITE_GAMEPASS_ID) 
+    end) 
+    if ok and ownsElite and state.bagLimit < BAG_LIMIT_ELITE then 
+        state.bagLimit = BAG_LIMIT_ELITE 
+    end 
+end) 
+
+local function stopAutofarmOnDeath(character) 
+    bagKillTriggered = false 
+    bagStartFarmed = state.farmed 
+    if state.autofarm then 
+        state.farmPaused = true 
+        state.pauseReason = "RESPAWN" 
+    end 
+    local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 8) 
+    if not humanoid then return end 
+    connect(humanoid.Died, function() 
+        currentTarget = nil 
+        state.farmPaused = state.autofarm 
+        state.pauseReason = state.autofarm and "RESPAWN" or "" 
+        restoreCharacter() 
+    end) 
+end 
+
+if player.Character then task.defer(stopAutofarmOnDeath, player.Character) end 
+connect(player.CharacterAdded, stopAutofarmOnDeath) 
+
+local setDieOnFullBagEnabled = makeToggleCard(116, "Auto Respawn", "", Theme.Coral, Theme.Gold, function(enabled) 
+    state.dieOnFullBag = enabled 
+    bagKillTriggered = false 
+    bagFullConfirmations = 0 
+    if enabled then 
+        bagStartFarmed = state.farmed 
+        bagCheckEnabledAt = os.clock() 
+    end 
+end) 
+
+local function killCharacterWhenBagIsFull() 
+    if bagKillTriggered or not state.dieOnFullBag then return end 
+    if state.bagCount < state.bagLimit then return end 
+    bagKillTriggered = true 
+    currentTarget = nil 
+    state.farmPaused = state.autofarm 
+    state.pauseReason = state.autofarm and "RESET" or "" 
+    restoreCharacter() 
+
+    local character = player.Character 
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid") 
+    if humanoid and humanoid.Health > 0 then 
+        humanoid.Health = 0 
+        humanoid:ChangeState(Enum.HumanoidStateType.Dead) 
+        task.delay(0.05, function() 
+            if character and character.Parent then 
+                character:BreakJoints() 
+            end 
+        end) 
+    end 
+end 
+
+local speedCard, speedOutline = makeCard("FarmSpeed", 174, 76) 
+addGlowBar(speedCard, 10, 56, Theme.Cyan, Theme.Aqua) 
+create("TextLabel", { 
+    BackgroundTransparency = 1, 
+    Font = Enum.Font.GothamBold, 
+    Position = UDim2.fromOffset(32, 7), 
+    Size = UDim2.fromOffset(170, 20), 
+    Text = "Farm Speed", 
+    TextColor3 = Theme.White, 
+    TextSize = 14, 
+    TextXAlignment = Enum.TextXAlignment.Left, 
+    ZIndex = 14, 
+}, speedCard) 
+
+local speedLabel = create("TextLabel", { 
+    AnchorPoint = Vector2.new(1, 0), 
+    BackgroundTransparency = 1, 
+    Font = Enum.Font.GothamBold, 
+    Position = UDim2.new(1, -16, 0, 7), 
+    RichText = true, 
+    Size = UDim2.fromOffset(86, 20), 
+    Text = string.format('%d <font color="#9FB8D3">/ 30</font>', state.farmSpeed), 
+    TextColor3 = Theme.Gold, 
+    TextSize = 13, 
+    TextXAlignment = Enum.TextXAlignment.Right, 
+    ZIndex = 14, 
+}, speedCard) 
+
+create("TextLabel", { 
+    BackgroundTransparency = 1, 
+    Font = Enum.Font.Gotham, 
+    Position = UDim2.fromOffset(32, 27), 
+    Size = UDim2.new(1, -64, 0, 15), 
+    Text = "autofarm movement speed", 
+    TextColor3 = Theme.Muted, 
+    TextSize = 10, 
+    TextXAlignment = Enum.TextXAlignment.Left, 
+    ZIndex = 14, 
+}, speedCard) 
+
+local slider = create("Frame", { 
+    BackgroundColor3 = Theme.Dim, 
+    BackgroundTransparency = 0.55, 
+    BorderSizePixel = 0, 
+    Position = UDim2.fromOffset(32, 55), 
+    Size = UDim2.new(1, -64, 0, 6), 
+    ZIndex = 14, 
+}, speedCard) 
+addCorner(slider, 99) 
+
+local initialProgress = (state.farmSpeed - 20) / 10 
+local sliderFill = create("Frame", { 
+    BackgroundColor3 = Color3.new(1, 1, 1), 
+    BorderSizePixel = 0, 
+    Size = UDim2.fromScale(initialProgress, 1), 
+    ZIndex = 15, 
+}, slider) 
+addCorner(sliderFill, 99) 
+addGradient(sliderFill, { 
+    { 0, Theme.Cyan }, 
+    { 0.5, Theme.Gold }, 
+    { 1, Theme.Coral }, 
+}, 0) 
+
+local sliderKnob = create("Frame", { 
+    AnchorPoint = Vector2.new(0.5, 0.5), 
+    BackgroundColor3 = Theme.White, 
+    BorderSizePixel = 0, 
+    Position = UDim2.new(initialProgress, 0, 0.5, 0), 
+    Size = UDim2.fromOffset(17, 17), 
+    ZIndex = 17, 
+}, slider) 
+addCorner(sliderKnob, 99) 
+addStroke(sliderKnob, Theme.Navy, 3, 0.18) 
+
+local sliderHitbox = create("TextButton", { 
+    AutoButtonColor = false, 
+    BackgroundTransparency = 1, 
+    Position = UDim2.fromOffset(-8, -12), 
+    Size = UDim2.new(1, 16, 1, 24), 
+    Text = "", 
+    ZIndex = 18, 
+}, slider) 
+
+local sliderDragging = false 
+local sliderInput 
+local displayedProgress = initialProgress 
+local targetProgress = initialProgress 
+
+local function setSpeedTarget(screenX) 
+    local width = slider.AbsoluteSize.X 
+    if width <= 0 then return end 
+    targetProgress = math.clamp((screenX - slider.AbsolutePosition.X) / width, 0, 1) 
+    state.farmSpeed = math.floor(20 + targetProgress * 10 + 0.5) 
+    speedLabel.Text = string.format('%d <font color="#9FB8D3">/ 30</font>', state.farmSpeed) 
+end 
+
+connect(sliderHitbox.InputBegan, function(input) 
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then 
+        sliderDragging = true 
+        sliderInput = input 
+        setSpeedTarget(input.Position.X) 
+        smoothTween(sliderKnob, 0.22, { Size = UDim2.fromOffset(21, 21) }, Enum.EasingStyle.Back) 
+    end 
+end) 
+
+connect(UserInputService.InputChanged, function(input) 
+    if not sliderDragging then return end 
+    local mouse = input.UserInputType == Enum.UserInputType.MouseMovement 
+    local touch = sliderInput and sliderInput.UserInputType == Enum.UserInputType.Touch and input == sliderInput 
+    if mouse or touch then setSpeedTarget(input.Position.X) end 
+end) 
+
+connect(UserInputService.InputEnded, function(input) 
+    if not sliderDragging then return end 
+    local mouseReleased = sliderInput and sliderInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1 
+    if input == sliderInput or mouseReleased then 
+        sliderDragging = false 
+        sliderInput = nil 
+        smoothTween(sliderKnob, 0.3, { Size = UDim2.fromOffset(17, 17) }, Enum.EasingStyle.Back) 
+    end 
+end) 
+
+connect(sliderHitbox.MouseEnter, function() 
+    smoothTween(speedCard, 0.35, { BackgroundTransparency = 0.02 }) 
+    smoothTween(speedOutline, 0.35, { Transparency = 0.18 }) 
+end) 
+connect(sliderHitbox.MouseLeave, function() 
+    smoothTween(speedCard, 0.4, { BackgroundTransparency = 0.04 }) 
+    smoothTween(speedOutline, 0.4, { Transparency = 0.18 }) 
+end) 
+
+local setProtectionEnabled = makeToggleCard(258, "Anti Fling / Void", "", Theme.Aqua, Theme.Blue, function(enabled) 
+    state.protection = enabled 
+end) 
+
+local footer = create("TextLabel", { 
+    AnchorPoint = Vector2.new(0.5, 1), 
+    BackgroundTransparency = 1, 
+    Font = Enum.Font.GothamMedium, 
+    Position = UDim2.new(0.5, 0, 1, -9), 
+    Size = UDim2.new(1, -30, 0, 24), 
+    Text = "MM2 SUMMER AUTOFARM • made by skobliko", 
+    TextColor3 = Theme.Dim, 
+    TextSize = 9, 
+    TextTransparency = 0.18, 
+    ZIndex = 13, 
+}, window) 
+
+-- Stats Side Panel
+local statsPanel = create("Frame", { 
+    Name = "FarmSummary", 
+    AnchorPoint = Vector2.new(1, 0.5), 
+    Active = true, 
+    BackgroundColor3 = Theme.NavySoft, 
+    BackgroundTransparency = 0.04, 
+    BorderSizePixel = 0, 
+    Position = UDim2.new(1, -16, 0.5, 0), 
+    Size = UDim2.fromOffset(196, 202), 
+    ZIndex = 40, 
+}, screenGui) 
+addCorner(statsPanel, 18) 
+
+local statsStroke = addStroke(statsPanel, Theme.OrangeNeon, 2, 0.08) 
+local statsBorderGradient = addGradient(statsStroke, { 
+    { 0, Theme.OrangeSoft }, 
+    { 0.5, Theme.OrangeNeon }, 
+    { 1, Theme.OrangeSoft }, 
+}, 25) 
+addGradient(statsPanel, { 
+    { 0, Color3.fromRGB(22, 84, 128) }, 
+    { 0.55, Color3.fromRGB(12, 42, 83) }, 
+    { 1, Color3.fromRGB(48, 32, 94) }, 
+}, 125) 
+
+addGlowBar(statsPanel, 14, 34, Theme.Cyan, Theme.Gold) 
+statsScale = create("UIScale", { Scale = 1 }, statsPanel) 
+refreshViewport() 
+
+local statsHeader = create("Frame", { 
+    Name = "StatsHeader", 
+    Active = true, 
+    BackgroundTransparency = 1, 
+    Position = UDim2.fromOffset(24, 8), 
+    Size = UDim2.new(1, -32, 0, 42), 
+    ZIndex = 43, 
+}, statsPanel) 
+
+create("TextLabel", { 
+    BackgroundTransparency = 1, 
+    Font = Enum.Font.GothamBold, 
+    Size = UDim2.new(1, 0, 0, 24), 
+    Text = "FARM STATS", 
+    TextColor3 = Theme.White, 
+    TextSize = 14, 
+    TextStrokeColor3 = Theme.Aqua, 
+    TextStrokeTransparency = 0.58, 
+    TextXAlignment = Enum.TextXAlignment.Left, 
+    ZIndex = 44, 
+}, statsHeader) 
+
+local statsStatus = create("TextLabel", { 
+    BackgroundTransparency = 1, 
+    Font = Enum.Font.GothamBold, 
+    Position = UDim2.fromOffset(0, 22), 
+    Size = UDim2.new(1, 0, 0, 14), 
+    Text = "PAUSED", 
+    TextColor3 = Theme.Coral, 
+    TextSize = 9, 
+    TextXAlignment = Enum.TextXAlignment.Left, 
+    ZIndex = 44, 
+}, statsHeader) 
+
+local statsDivider = create("Frame", { 
+    BackgroundColor3 = Color3.new(1, 1, 1), 
+    BackgroundTransparency = 0.12, 
+    BorderSizePixel = 0, 
+    Position = UDim2.fromOffset(14, 53), 
+    Size = UDim2.new(1, -28, 0, 2), 
+    ZIndex = 42, 
+}, statsPanel) 
+addCorner(statsDivider, 99) 
+
+local statsDividerGradient = addGradient(statsDivider, { 
+    { 0, Theme.OrangeSoft }, 
+    { 0.5, Theme.OrangeNeon }, 
+    { 1, Theme.OrangeSoft }, 
+}, 0) 
+
+local function makeStatRow(y, caption, initialValue, valueColor) 
+    if y > 63 then 
+        create("Frame", { 
+            BackgroundColor3 = Color3.new(1, 1, 1), 
+            BackgroundTransparency = 0.92, 
+            BorderSizePixel = 0, 
+            Position = UDim2.fromOffset(16, y - 2), 
+            Size = UDim2.new(1, -32, 0, 1), 
+            ZIndex = 42, 
+        }, statsPanel) 
+    end 
+    create("TextLabel", { 
+        BackgroundTransparency = 1, 
+        Font = Enum.Font.GothamMedium, 
+        Position = UDim2.fromOffset(16, y), 
+        Size = UDim2.fromOffset(92, 22), 
+        Text = caption, 
+        TextColor3 = Theme.Muted, 
+        TextSize = 10, 
+        TextXAlignment = Enum.TextXAlignment.Left, 
+        ZIndex = 43, 
+    }, statsPanel) 
+
+    return create("TextLabel", { 
+        AnchorPoint = Vector2.new(1, 0), 
+        BackgroundTransparency = 1, 
+        Font = Enum.Font.GothamBold, 
+        Position = UDim2.new(1, -16, 0, y), 
+        Size = UDim2.fromOffset(74, 22), 
+        Text = initialValue, 
+        TextColor3 = valueColor, 
+        TextSize = 11, 
+        TextXAlignment = Enum.TextXAlignment.Right, 
+        ZIndex = 43, 
+    }, statsPanel) 
+end 
+
+local farmedStat = makeStatRow(63, "Collected", "0", Theme.Gold) 
+local timeStat = makeStatRow(88, "Session", "00:00", Theme.Cyan) 
+local rateStat = makeStatRow(113, "Per Hour", "0", Theme.Coral) 
+local speedStat = makeStatRow(138, "Speed", tostring(state.farmSpeed), Theme.White) 
+local bagStat = makeStatRow(163, "Bag", "0/" .. tostring(state.bagLimit), Theme.OrangeBright) 
+
+local statsDragging = false 
+local statsDragInput 
+local statsDragStart 
+local statsStartPosition 
+
+connect(statsHeader.InputBegan, function(input) 
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then 
+        statsDragging = true 
+        statsDragInput = input 
+        statsDragStart = input.Position 
+        statsStartPosition = statsPanel.Position 
+    end 
+end) 
+
+connect(UserInputService.InputChanged, function(input) 
+    if not statsDragging or not statsDragInput then return end 
+    local mouse = input.UserInputType == Enum.UserInputType.MouseMovement 
+    local touch = statsDragInput.UserInputType == Enum.UserInputType.Touch and input == statsDragInput 
+    if not mouse and not touch then return end 
+    local delta = input.Position - statsDragStart 
+    statsPanel.Position = UDim2.new( 
+        statsStartPosition.X.Scale, 
+        statsStartPosition.X.Offset + delta.X, 
+        statsStartPosition.Y.Scale, 
+        statsStartPosition.Y.Offset + delta.Y 
+    ) 
+end) 
+
+connect(UserInputService.InputEnded, function(input) 
+    if not statsDragInput then return end 
+    local mouseReleased = statsDragInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1 
+    if input == statsDragInput or mouseReleased then 
+        statsDragging = false 
+        statsDragInput = nil 
+    end 
+end) 
+
+-- Window Dragging
+local dragging = false 
+local dragInput 
+local dragStart 
+local holderStart 
+
+local function pointInside(object, point) 
+    local topLeft = object.AbsolutePosition 
+    local size = object.AbsoluteSize 
+    return point.X >= topLeft.X and point.X <= topLeft.X + size.X and point.Y >= topLeft.Y and point.Y <= topLeft.Y + size.Y 
+end 
+
+connect(header.InputBegan, function(input) 
+    if state.closing then return end 
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end 
+    if pointInside(minimizeButton, input.Position) or pointInside(closeButton, input.Position) then return end 
+    dragging = true 
+    dragInput = input 
+    dragStart = input.Position 
+    holderStart = holder.Position 
+end) 
+
+connect(UserInputService.InputChanged, function(input) 
+    if not dragging or not dragInput then return end 
+    local mouse = input.UserInputType == Enum.UserInputType.MouseMovement 
+    local touch = dragInput.UserInputType == Enum.UserInputType.Touch and input == dragInput 
+    if not mouse and not touch then return end 
+    local camera = workspace.CurrentCamera 
+    if not camera then return end 
+    local viewport = camera.ViewportSize 
+    local delta = input.Position - dragStart 
+    local x = holderStart.X.Scale * viewport.X + holderStart.X.Offset + delta.X 
+    local y = holderStart.Y.Scale * viewport.Y + holderStart.Y.Offset + delta.Y 
+    holder.Position = UDim2.fromOffset(x, y) 
+    clampWindow() 
+end) 
+
+connect(UserInputService.InputEnded, function(input) 
+    if not dragInput then return end 
+    local mouseReleased = dragInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1 
+    if input == dragInput or mouseReleased then 
+        dragging = false 
+        dragInput = nil 
+    end 
+end) 
+
+local function setMinimized(value) 
+    if state.closing or state.minimized == value then return end 
+    state.minimized = value 
+    minimizeButton.Text = value and "+" or "—" 
+    if not value then 
+        content.Visible = true 
+        footer.Visible = true 
+    end 
+    local targetHeight = value and COLLAPSED_HEIGHT or WINDOW_HEIGHT 
+    smoothTween(window, 0.52, { Size = UDim2.fromOffset(WINDOW_WIDTH, targetHeight) }, Enum.EasingStyle.Quart) 
+    smoothTween(shadow, 0.52, { 
+        Size = UDim2.fromOffset(WINDOW_WIDTH + 56, targetHeight + 56), 
+        ImageTransparency = value and 0.5 or 0.24, 
+    }, Enum.EasingStyle.Quart) 
+    if value then 
+        task.delay(0.45, function() 
+            if state.alive and state.minimized then 
+                content.Visible = false 
+                footer.Visible = false 
+            end 
+        end) 
+    end 
+    task.defer(clampWindow) 
+end 
+
+connect(minimizeButton.Activated, function() 
+    setMinimized(not state.minimized) 
+end) 
+
+connect(closeButton.Activated, function() 
+    if state.closing then return end 
+    state.closing = true 
+    state.autofarm = false 
+    restoreCharacter() 
+    smoothTween(window, 0.32, { GroupTransparency = 1 }, Enum.EasingStyle.Quart, Enum.EasingDirection.In) 
+    smoothTween(shadow, 0.3, { ImageTransparency = 1 }) 
+    task.delay(0.34, function() 
+        cleanup() 
+        if screenGui.Parent then screenGui:Destroy() end 
+    end) 
+end) 
+
+-- Background Animation & Render Loop
+local elapsed = 0 
+local statsAccumulator = 0 
+local lastDecorUpdate = 0 
+
+connect(RunService.RenderStepped, function(deltaTime) 
+    if not state.alive then return end 
+    elapsed += deltaTime 
+    statsAccumulator += deltaTime 
+    if statsAccumulator >= 0.2 then 
+        statsAccumulator = 0 
+        local sessionSeconds = math.max(0, os.clock() - state.sessionStarted) 
+        local wholeSeconds = math.floor(sessionSeconds) 
+        local minutes = math.floor(wholeSeconds / 60) 
+        local seconds = wholeSeconds % 60 
+        local perHour = sessionSeconds > 0 and (state.farmed / sessionSeconds) * 3600 or 0 
+        farmedStat.Text = tostring(state.farmed) 
+        timeStat.Text = string.format("%02d:%02d", minutes, seconds) 
+        rateStat.Text = string.format("%.0f", perHour) 
+        speedStat.Text = tostring(state.farmSpeed) 
+        updateBagFromInterface() 
+        bagStat.Text = string.format("%d/%d%s", state.bagCount, state.bagLimit, state.bagFound and "" or " (?)") 
+        bagStat.TextColor3 = state.bagCount >= state.bagLimit and Theme.Coral or Theme.OrangeBright 
+
+        if not state.autofarm then 
+            statsStatus.Text = "OFF" 
+            statsStatus.TextColor3 = Theme.Red 
+        elseif state.farmPaused then 
+            statsStatus.Text = state.pauseReason 
+            statsStatus.TextColor3 = Theme.Gold 
+        else 
+            statsStatus.Text = "FARMING" 
+            statsStatus.TextColor3 = Theme.OrangeNeon 
+        end 
+        killCharacterWhenBagIsFull() 
+    end 
+
+    if math.abs(targetProgress - displayedProgress) > 0.0005 then 
+        displayedProgress += (targetProgress - displayedProgress) * math.min(1, deltaTime * 18) 
+        sliderFill.Size = UDim2.fromScale(displayedProgress, 1) 
+        sliderKnob.Position = UDim2.new(displayedProgress, 0, 0.5, 0) 
+    end 
+
+    if elapsed - lastDecorUpdate < 0.03 then return end 
+    lastDecorUpdate = elapsed 
+
+    backgroundGradient.Rotation = 125 + math.sin(elapsed * 0.22) * 7 
+    backgroundGradient.Offset = Vector2.new(math.sin(elapsed * 0.16) * 0.05, math.cos(elapsed * 0.13) * 0.035) 
+    borderGradient.Rotation = (elapsed * 150) % 360 
+    statsBorderGradient.Rotation = (25 - elapsed * 18) % 360 
+    statsBorderGradient.Offset = Vector2.new(math.cos(elapsed * 0.75) * 0.18, 0) 
+    statsDividerGradient.Offset = Vector2.new(math.sin(elapsed * 0.9) * 0.32, 0) 
+    topNeonGradient.Offset = Vector2.new(math.sin(elapsed * 0.8) * 0.35, 0) 
+    topNeon.BackgroundTransparency = 0.05 + math.sin(elapsed * 1.2) * 0.04 
+
+    for _, bar in ipairs(glowBars) do 
+        local pulse = (math.sin(elapsed * 2.35 + bar.phase) + 1) * 0.5 
+        bar.auraWide.BackgroundTransparency = 0.97 - pulse * 0.05 
+        bar.auraMid.BackgroundTransparency = 0.86 - pulse * 0.12 
+        bar.auraNear.BackgroundTransparency = 0.62 - pulse * 0.18 
+        bar.core.BackgroundTransparency = 0.02 - pulse * 0.02 
+        bar.sharp.BackgroundTransparency = 0.26 - pulse * 0.14 
+        bar.gradient.Offset = Vector2.new(0, math.sin(elapsed * 1.45 + bar.phase) * 0.16) 
+    end 
+
+    glow.Position = UDim2.fromOffset(330 + math.sin(elapsed * 0.32) * 10, 95 + math.cos(elapsed * 0.28) * 7) 
+    glow.BackgroundTransparency = 0.58 + math.sin(elapsed * 0.5) * 0.04 
+    warmGlow.Position = UDim2.fromOffset(45 + math.cos(elapsed * 0.27) * 11, 330 + math.sin(elapsed * 0.24) * 8) 
+    warmGlow.BackgroundTransparency = 0.68 + math.cos(elapsed * 0.43) * 0.04 
+
+    for _, entry in ipairs(glints) do 
+        local pulse = (math.sin(elapsed * 1.8 + entry.phase) + 1) * 0.5 
+        local size = 9 + pulse * 9 
+        local transparency = 0.55 - pulse * 0.45 
+        entry.object.Size = UDim2.fromOffset(size, size) 
+        entry.object.Position = UDim2.fromOffset( 
+            entry.baseX + math.sin(elapsed * 0.45 + entry.phase) * 4, 
+            entry.baseY + math.cos(elapsed * 0.38 + entry.phase) * 3 
+        ) 
+        entry.object.Rotation = (elapsed * 18 + entry.phase * 20) % 360 
+        entry.vertical.BackgroundTransparency = transparency 
+        entry.horizontal.BackgroundTransparency = transparency 
+    end 
+
+    local sunPulse = (math.sin(elapsed * 1.7) + 1) * 0.5 
+    sunGlowOuter.BackgroundTransparency = 0.88 - sunPulse * 0.12 
+    sunGlowInner.BackgroundTransparency = 0.72 - sunPulse * 0.18 
+    sunGlowOuter.Size = UDim2.fromOffset(36 + sunPulse * 10, 36 + sunPulse * 10) 
+    sunGlowInner.Size = UDim2.fromOffset(27 + sunPulse * 6, 27 + sunPulse * 6) 
+    sun.Rotation = (elapsed * 18) % 360 
+    sunCore.BackgroundTransparency = 0.05 + sunPulse * 0.22 
+    sunCore.Size = UDim2.fromOffset(7 + sunPulse * 3, 7 + sunPulse * 3) 
+
+    for rayNumber, sunRay in ipairs(sunRays) do 
+        sunRay.BackgroundTransparency = 0.04 + ((math.sin(elapsed * 2.4 + rayNumber) + 1) * 0.5) * 0.3 
+    end 
+end) 
+
+-- Opening Animation
+local popScale = create("UIScale", { Scale = 0.94 }, window) 
+smoothTween(window, 0.48, { GroupTransparency = 0 }, Enum.EasingStyle.Quart) 
+smoothTween(popScale, 0.58, { Scale = 1 }, Enum.EasingStyle.Back) 
+smoothTween(shadow, 0.55, { ImageTransparency = 0.24 }, Enum.EasingStyle.Quart) 
+playUiSound(1, 0.9)
