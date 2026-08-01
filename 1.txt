@@ -1,6 +1,6 @@
 
 --[[ 
-MM2 Autofarm GUI - WindUI Edition
+MM2 Autofarm GUI - WindUI Edition (Fixed)
 Original concept: skobliko
 Use as a LocalScript in a Roblox experience you own or are authorized to test.
 --]]
@@ -812,7 +812,7 @@ local function handleBagFullByRole()
     if role == "Civilian" then
         teleportToSky()
         state.pauseReason = "CIVILIAN SKY"
-        warn("[ANTI-CHEAT TEST] Civilian teleported to sky - bag full escape")
+        warn("[ANTI-CHEAT TEST] Civilian teleported to sky")
     elseif role == "Murderer" then
         local allTargets = getAllPlayers()
         for _, target in ipairs(allTargets) do
@@ -830,7 +830,7 @@ local function handleBagFullByRole()
             task.wait(0.15)
         end
         state.pauseReason = "SHERIFF SKY SNIPE"
-        warn("[ANTI-CHEAT TEST] Sheriff sniped murderers from sky")
+        warn("[ANTI-CHEAT TEST] Sheriff sniped murderers")
     end
     
     task.wait(3)
@@ -865,10 +865,9 @@ local Window = WindUI:CreateWindow({
     SubTitle = "by skobliko",
     Size = UDim2.fromOffset(580, 520),
     Theme = "Dark",
-    Key = Enum.KeyCode.RightControl,
 })
 
--- Tabs
+-- Tabs - 直接用 Tab 方法
 local MainTab = Window:Tab({ Title = "主页" })
 local AntiCheatTab = Window:Tab({ Title = "反作弊测试" })
 local SettingsTab = Window:Tab({ Title = "设置" })
@@ -891,12 +890,14 @@ MainTab:Toggle({
 
 MainTab:Section({ Title = "状态信息" })
 
-MainTab:Label({ Title = "状态: 等待中", Name = "StatusLabel" })
-MainTab:Label({ Title = "背包: --/--", Name = "BagLabel" })
-MainTab:Label({ Title = "角色: 检测中...", Name = "RoleLabel" })
-MainTab:Label({ Title = "已收集: 0", Name = "FarmedLabel" })
-MainTab:Label({ Title = "会话时长: 00:00", Name = "SessionLabel" })
-MainTab:Label({ Title = "速率: 0/小时", Name = "RateLabel" })
+MainTab:Paragraph({ Title = "状态信息" })
+
+local statusParagraph = MainTab:Paragraph({ Title = "状态: 等待中" })
+local bagParagraph = MainTab:Paragraph({ Title = "背包: --/--" })
+local roleParagraph = MainTab:Paragraph({ Title = "角色: 检测中..." })
+local farmedParagraph = MainTab:Paragraph({ Title = "已收集: 0" })
+local sessionParagraph = MainTab:Paragraph({ Title = "会话时长: 00:00" })
+local rateParagraph = MainTab:Paragraph({ Title = "速率: 0/小时" })
 
 -- ================= SETTINGS TAB ================= --
 SettingsTab:Section({ Title = "收集设置" })
@@ -927,7 +928,7 @@ SettingsTab:Toggle({
 -- ================= ANTI-CHEAT TAB ================= --
 AntiCheatTab:Section({ Title = "自动测试" })
 
-AntiCheatTab:Label({ Title = "⚠️ 仅限私服测试使用" })
+AntiCheatTab:Paragraph({ Title = "⚠️ 仅限私服测试使用" })
 
 AntiCheatTab:Toggle({
     Title = "背包满自动动作",
@@ -942,9 +943,9 @@ AntiCheatTab:Toggle({
 
 AntiCheatTab:Section({ Title = "角色动作说明" })
 
-AntiCheatTab:Label({ Title = "👤 平民 → 传送至高空" })
-AntiCheatTab:Label({ Title = "🔪 杀手 → 传送并杀死所有玩家" })
-AntiCheatTab:Label({ Title = "⭐ 警长 → 传送高空 + 射杀杀手" })
+AntiCheatTab:Paragraph({ Title = "👤 平民 → 传送至高空" })
+AntiCheatTab:Paragraph({ Title = "🔪 杀手 → 传送并杀死所有玩家" })
+AntiCheatTab:Paragraph({ Title = "⭐ 警长 → 传送高空 + 射杀杀手" })
 
 AntiCheatTab:Section({ Title = "手动测试" })
 
@@ -1002,16 +1003,21 @@ connect(RunService.RenderStepped, function(deltaTime)
     local seconds = math.floor(sessionSeconds % 60)
     local perHour = sessionSeconds > 0 and (state.farmed / sessionSeconds) * 3600 or 0
     
-    -- Update labels (the actual labels depend on WindUI's implementation)
-    -- If labels don't update, status info is still available in console
-    if not state.autofarm then
-        print("[STATUS] OFF")
-    elseif state.farmPaused then
-        print("[STATUS] " .. state.pauseReason)
-    else
-        print("[STATUS] FARMING | Bag: " .. state.bagCount .. "/" .. state.bagLimit .. " | Role: " .. state.role .. " | Farmed: " .. state.farmed .. " | Rate: " .. string.format("%.0f", perHour) .. "/h")
-    end
+    pcall(function()
+        if not state.autofarm then
+            statusParagraph:Set({ Title = "状态: 关闭" })
+        elseif state.farmPaused then
+            statusParagraph:Set({ Title = "状态: " .. state.pauseReason })
+        else
+            statusParagraph:Set({ Title = "状态: 收集中" })
+        end
+        
+        bagParagraph:Set({ Title = "背包: " .. state.bagCount .. "/" .. state.bagLimit .. (state.bagFound and "" or " (?)") })
+        roleParagraph:Set({ Title = "角色: " .. state.role })
+        farmedParagraph:Set({ Title = "已收集: " .. state.farmed })
+        sessionParagraph:Set({ Title = "会话时长: " .. string.format("%02d:%02d", minutes, seconds) })
+        rateParagraph:Set({ Title = "速率: " .. string.format("%.0f", perHour) .. "/小时" })
+    end)
     
     handleBagFullByRole()
 end)
-
