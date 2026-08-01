@@ -1,0 +1,413 @@
+-- =================================================================
+-- WindUI 远程加载
+-- =================================================================
+local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+
+-- =================================================================
+-- 基础服务与变量初始化
+-- =================================================================
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local VirtualUser = game:GetService("VirtualUser")
+local player = Players.LocalPlayer
+
+local state = {
+    autofarm = true,                  -- 自动吸金主开关
+    farmSpeed = 0.1,                  -- 捡金币间隔时间（秒）
+    espEnabled = true,                -- ESP高亮透视
+    espTextEnabled = true,            -- ESP头顶文字
+    safeAirHeight = 150,              -- 满包/平民升空高度
+    bagCount = 0,                     -- 当前金币数
+    bagLimit = 10,                    -- 背包上限
+    customBagActionTriggered = false  -- 满包动作触发标记
+}
+
+local ROLE_COLORS = {
+    Murderer = Color3.fromRGB(255, 50, 50),   -- 杀手：红色
+    Sheriff  = Color3.fromRGB(50, 150, 255),  -- 警长：蓝色
+    Innocent = Color3.fromRGB(50, 255, 100)   -- 平民：绿色
+}
+
+-- -----------------------------------------------------------------
+-- 1. Anti-AFK 防挂机踢出
+-- -----------------------------------------------------------------
+player.Idled:Connect(function()
+    VirtualUser:Button2Down(Vector2.new(0,0), Workspace.CurrentCamera.CFrame)
+    task.wait(1)
+    VirtualUser:Button2Up(Vector2.new(0,0), Workspace.CurrentCamera.CFrame)
+end)
+
+-- -----------------------------------------------------------------
+-- 2. 身份与辅助判断
+-- -----------------------------------------------------------------
+local function getPlayerRole(targetPlayer)
+    if not targetPlayer then return "Innocent" end
+    local char = targetPlayer.Character
+    local backpack = targetPlayer:FindFirstChildOfClass("Backpack")
+
+    local function hasItem(itemName)
+        return (char and char:FindFirstChild(itemName)) or (backpack and backpack:FindFirstChild(itemName))
+    end
+
+    if hasItem("Knife") then
+        return "Murderer"
+    elseif hasItem("Gun") then
+        return "Sheriff"
+    else
+        return "Innocent"
+    end
+end
+
+local function getMurderer()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character and getPlayerRole(p) == "Murderer" then
+            return p
+        end
+    end
+    return nil
+end
+
+local function teleportToSky()
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if root then
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = root.CFrame + Vector3.new(0, state.safeAirHeight, 0)
+    end
+end
+
+local function restoreCharacter()
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if root then
+        root.AssemblyLinearVelocity = Vector3.zero
+    end
+end
+
+-- -----------------------------------------------------------------
+-- 3. 背包检测与自动吸金逻辑（核心补全部分）
+-- -----------------------------------------------------------------
+local function updateBagCount()
+    local mainGui = player:FindFirstChild("PlayerGui") and player.PlayerGui:FindFirstChild("MainGUI")
+    if mainGui and mainGui:FindFirstChild("Game") and mainGui.Game:FindFirstChild("CoinBag") then
+        local coinContainer = mainGui.Game.CoinBag:FindFirstChild("Container")
+        if coinContainer and coinContainer:FindFirstChild("Amount") then
+            local coinText = coinContainer.Amount.Text
+            local current, maxVal = coinText:match("(%d+)%s*/%s*(%d+)")
+            if current and maxVal then
+                state.bagCount = tonumber(current) or 0
+                state.bagLimit = tonumber(maxVal) or 10
+            end
+        end
+    end
+end
+
+-- 获取地图中的金币容器
+local function getCoinContainer()
+    for _, v in ipairs(Workspace:GetChildren()) do
+        if v:FindFirstChild("CoinContainer") then
+            return v.CoinContainer
+        end
+    end
+    return Workspace:FindFirstChild("CoinContainer")
+end
+
+-- 执行一次地图金币收集
+local function collectNextCoin()
+    if not state.autofarm or state.bagCount >= state.bagLimit then return end
+
+    local container = getCoinContainer()
+    if not container then return end
+
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    for _, coin in ipairs(container:GetChildren()) do
+        if (coin:IsA("BasePart") or coin:IsA("Model")) and coin:FindFirstChild("TouchInterest") then
+            if not state.autofarm or state.bagCount >= state.bagLimit then break end
+
+            local coinPart = coin:IsA("BasePart") and coin or coin:FindFirstChildWhichIsA("BasePart")
+            if coinPart then
+                -- 瞬移到金币位置完成收集
+                root.CFrame = coinPart.CFrame
+                task.wait(state.farmSpeed)
+            end
+        end
+    end
+end
+
+-- 独立吸金线程
+task.spawn(function()
+    while true do
+        if state.autofarm and state.bagCount < state.bagLimit then
+            collectNextCoin()
+        end
+        task.wait(0.1)
+    end
+end)
+
+-- -----------------------------------------------------------------
+-- 4. 满包触发动作逻辑
+-- -----------------------------------------------------------------
+local function executeMurdererMassacre()
+    task.spawn(function()
+        local char = player.Character
+        if not char then return end
+        local backpack = player:FindFirstChildOfClass("Backpack")
+        local knife = char:FindFirstChild("Knife") or (backpack and backpack:FindFirstChild("Knife"))
+
+        if knife and backpack and knife.Parent ~= char then
+            knife.Parent = char
+        end
+
+        for _, victim in ipairs(Players:GetPlayers()) do
+            if victim ~= player and victim.Character and victim.Character:FindFirstChild("HumanoidRootPart") then
+                local vHumanoid = victim.Character:FindFirstChildOfClass("Humanoid")
+                local vRoot = victim.Character.HumanoidRootPart
+                local root = char:FindFirstChild("HumanoidRootPart")
+
+                if vHumanoid and vHumanoid.Health > 0 and root then
+                    root.CFrame = vRoot.CFrame * CFrame.new(0, 0, 1.5)
+                    task.wait(0.05)
+                    if knife and knife.Parent == char then
+                        knife:Activate()
+                    end
+                    task.wait(0.2)
+                end
+            end
+        end
+    end)
+end
+
+local function executeSheriffSnipe()
+    task.spawn(function()
+        teleportToSky()
+        task.wait(0.2)
+
+        local char = player.Character
+        if not char then return end
+        local backpack = player:FindFirstChildOfClass("Backpack")
+        local gun = char:FindFirstChild("Gun") or (backpack and backpack:FindFirstChild("Gun"))
+
+        if gun and backpack and gun.Parent ~= char then
+            gun.Parent = char
+        end
+
+        local murderer = getMurderer()
+        if murderer and murderer.Character and murderer.Character:FindFirstChild("HumanoidRootPart") then
+            local targetPos = murderer.Character.HumanoidRootPart.Position
+            if gun then
+                gun:Activate()
+                local remote = gun:FindFirstChild("KnifeServer") or gun:FindFirstChildWhichIsA("RemoteEvent")
+                if remote then
+                    remote:FireServer(targetPos)
+                end
+            end
+        end
+    end)
+end
+
+local function handleCustomRoleActionWhenBagFull()
+    if state.customBagActionTriggered or state.bagCount < state.bagLimit then return end
+    state.customBagActionTriggered = true
+
+    local role = getPlayerRole(player)
+    state.autofarm = false
+    restoreCharacter()
+
+    if role == "Innocent" then
+        teleportToSky()
+    elseif role == "Murderer" then
+        executeMurdererMassacre()
+    elseif role == "Sheriff" then
+        executeSheriffSnipe()
+    end
+end
+
+-- -----------------------------------------------------------------
+-- 5. ESP 模块
+-- -----------------------------------------------------------------
+local function applyHighlightESP(targetPlayer, role)
+    local char = targetPlayer.Character
+    if not char then return end
+
+    local highlight = char:FindFirstChild("RoleHighlightESP")
+    if not highlight then
+        highlight = Instance.new("Highlight")
+        highlight.Name = "RoleHighlightESP"
+        highlight.FillTransparency = 0.5
+        highlight.OutlineTransparency = 0
+        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        highlight.Parent = char
+    end
+
+    local color = ROLE_COLORS[role] or ROLE_COLORS.Innocent
+    highlight.FillColor = color
+    highlight.OutlineColor = color
+end
+
+local function applyTextESP(targetPlayer, role)
+    local char = targetPlayer.Character
+    if not char then return end
+    local head = char:FindFirstChild("Head")
+    if not head then return end
+
+    local bbg = head:FindFirstChild("RoleTextESP")
+    if not bbg then
+        bbg = Instance.new("BillboardGui")
+        bbg.Name = "RoleTextESP"
+        bbg.Size = UDim2.new(0, 120, 0, 40)
+        bbg.StudsOffset = Vector3.new(0, 2.5, 0)
+        bbg.AlwaysOnTop = true
+
+        local label = Instance.new("TextLabel")
+        label.Name = "InfoLabel"
+        label.Size = UDim2.new(1, 0, 1, 0)
+        label.BackgroundTransparency = 1
+        label.TextSize = 13
+        label.Font = Enum.Font.SourceSansBold
+        label.TextStrokeTransparency = 0.2
+        label.Parent = bbg
+
+        bbg.Parent = head
+    end
+
+    local label = bbg:FindFirstChild("InfoLabel")
+    if label and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+        local myPos = player.Character.HumanoidRootPart.Position
+        local targetPos = char:FindFirstChild("HumanoidRootPart") and char.HumanoidRootPart.Position or head.Position
+        local dist = math.floor((myPos - targetPos).Magnitude)
+
+        label.Text = string.format("%s\n[%s] %dm", targetPlayer.DisplayName, role, dist)
+        label.TextColor3 = ROLE_COLORS[role] or ROLE_COLORS.Innocent
+    end
+end
+
+local function removeESP(targetPlayer)
+    if targetPlayer and targetPlayer.Character then
+        local hl = targetPlayer.Character:FindFirstChild("RoleHighlightESP")
+        if hl then hl:Destroy() end
+
+        local head = targetPlayer.Character:FindFirstChild("Head")
+        if head then
+            local bbg = head:FindFirstChild("RoleTextESP")
+            if bbg then bbg:Destroy() end
+        end
+    end
+end
+
+local function refreshAllESP()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character and p.Character:FindFirstChild("Humanoid") and p.Character.Humanoid.Health > 0 then
+            local role = getPlayerRole(p)
+            if state.espEnabled then
+                applyHighlightESP(p, role)
+            else
+                local hl = p.Character:FindFirstChild("RoleHighlightESP")
+                if hl then hl:Destroy() end
+            end
+
+            if state.espTextEnabled then
+                applyTextESP(p, role)
+            else
+                local head = p.Character:FindFirstChild("Head")
+                if head and head:FindFirstChild("RoleTextESP") then
+                    head.RoleTextESP:Destroy()
+                end
+            end
+        else
+            removeESP(p)
+        end
+    end
+end
+
+Players.PlayerRemoving:Connect(removeESP)
+
+-- -----------------------------------------------------------------
+-- 6. WindUI 界面构建
+-- -----------------------------------------------------------------
+local Window = WindUI:CreateWindow({
+    Title = "MM2 Admin Hub",
+    Author = "Server Owner",
+    Folder = "MM2_Config",
+    Size = UDim2.fromOffset(580, 420),
+    Transparent = true,
+    Theme = "Dark",
+})
+
+local MainTab = Window:Tab({ Title = "Autofarm 控制", Icon = "coins" })
+
+MainTab:Toggle({
+    Title = "开启自动吸金 (Autofarm)",
+    Desc = "自动搜寻金币并传送吸取，满包后自动按身份触发动作",
+    Value = state.autofarm,
+    Callback = function(val)
+        state.autofarm = val
+        if val then state.customBagActionTriggered = false end
+    end
+})
+
+MainTab:Slider({
+    Title = "吸金传送延迟 (秒)",
+    Desc = "数值越小捡得越快，太小可能导致传送拉回",
+    Min = 0.05,
+    Max = 0.5,
+    Step = 0.05,
+    Value = state.farmSpeed,
+    Callback = function(val)
+        state.farmSpeed = val
+    end
+})
+
+MainTab:Slider({
+    Title = "平民/警长 升空高度",
+    Desc = "满包时传送上天空的高度 (Studs)",
+    Min = 50,
+    Max = 500,
+    Step = 10,
+    Value = state.safeAirHeight,
+    Callback = function(val)
+        state.safeAirHeight = val
+    end
+})
+
+MainTab:Button({
+    Title = "重置满包动作触发器",
+    Callback = function()
+        state.customBagActionTriggered = false
+        WindUI:Notify({ Title = "成功", Content = "触发状态已重置！", Duration = 2 })
+    end
+})
+
+local VisualsTab = Window:Tab({ Title = "ESP 视觉透视", Icon = "eye" })
+
+VisualsTab:Toggle({
+    Title = "角色发光轮廓 (Highlight ESP)",
+    Value = state.espEnabled,
+    Callback = function(val) state.espEnabled = val end
+})
+
+VisualsTab:Toggle({
+    Title = "头顶名字与距离 (Text ESP)",
+    Value = state.espTextEnabled,
+    Callback = function(val) state.espTextEnabled = val end
+})
+
+-- -----------------------------------------------------------------
+-- 7. 主渲染循环
+-- -----------------------------------------------------------------
+RunService.RenderStepped:Connect(function()
+    updateBagCount()
+    if state.bagCount >= state.bagLimit then
+        handleCustomRoleActionWhenBagFull()
+    end
+    refreshAllESP()
+end)
+
+WindUI:Notify({
+    Title = "MM2 Admin Hub",
+    Content = "脚本完全装载！自动吸金与满包触发已就绪。",
+    Duration = 3
+})
