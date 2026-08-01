@@ -1,6 +1,6 @@
 
 --[[ 
-MM2 Autofarm GUI - WindUI Edition (Auto Restart)
+MM2 Autofarm GUI - WindUI Edition (Fixed)
 Original concept: skobliko
 Use as a LocalScript in a Roblox experience you own or are authorized to test.
 --]]
@@ -446,7 +446,7 @@ local function teleportToSky()
     local character = player.Character
     local rootPart = character and character:FindFirstChild("HumanoidRootPart")
     if not rootPart then return end
-    local skyPosition = rootPart.Position + Vector3.new(0, 500, 0)
+    local skyPosition = rootPart.Position + Vector3.new(0, 200, 0)
     rootPart.CFrame = CFrame.new(skyPosition)
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
@@ -455,6 +455,21 @@ local function teleportToSky()
     if humanoid then
         humanoid.PlatformStand = true
     end
+    task.delay(3, function()
+        if character and character.Parent and rootPart and rootPart.Parent then
+            local ray = Ray.new(rootPart.Position, Vector3.new(0, -500, 0))
+            local hit = workspace:Raycast(ray.Origin, ray.Direction)
+            local groundPos = rootPart.Position - Vector3.new(0, 200, 0)
+            if hit then
+                groundPos = hit.Position + Vector3.new(0, 5, 0)
+            end
+            rootPart.CFrame = CFrame.new(groundPos)
+            rootPart.AssemblyLinearVelocity = Vector3.zero
+            if humanoid then
+                humanoid.PlatformStand = false
+            end
+        end
+    end)
 end
 
 local function killPlayer(targetPlayer)
@@ -497,7 +512,6 @@ local function autoPickupGunLoop()
     
     if detectRole() ~= "Civilian" then return end
     
-    -- 找死亡警长的枪
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= player and p.Character then
             local humanoid = p.Character:FindFirstChildOfClass("Humanoid")
@@ -516,7 +530,6 @@ local function autoPickupGunLoop()
                                     pcall(fireTouch, rootPart, child.Parent, 0)
                                     pcall(fireTouch, rootPart, child.Parent, 1)
                                 end
-                                print("[AUTO GUN] Picked up sheriff's gun!")
                             end
                             return
                         end
@@ -532,14 +545,16 @@ local bagKillTriggered = false
 local function handleBagFullByRole()
     if state.bagFullActionDone then return end
     if not state.dieOnFullBag then return end
-    if state.bagCount < state.bagLimit then return end
+    if state.farmed < state.bagLimit then return end
     if bagKillTriggered then return end
     
     bagKillTriggered = true
     state.bagFullActionDone = true
     
+    state.farmed = 0
+    state.bagCount = 0
+    
     currentTarget = nil
-    -- 不关 autofarm，下回合自动恢复
     state.farmPaused = true
     state.pauseReason = "BAG FULL ACTION"
     restoreCharacter()
@@ -574,6 +589,12 @@ local function handleBagFullByRole()
 end
 
 -- ================= FARM HEARTBEAT ================= --
+local voidThreshold = -440
+do
+    local ok, destroyHeight = pcall(function() return workspace.FallenPartsDestroyHeight end)
+    if ok and typeof(destroyHeight) == "number" then voidThreshold = destroyHeight + 80 end
+end
+
 RunService.Heartbeat:Connect(function(deltaTime)
     if not state.alive then return end
     
@@ -642,6 +663,12 @@ RunService.Heartbeat:Connect(function(deltaTime)
     end
     farmIdle = false
     local targetPosition = target.Position - Vector3.new(0, FLY_BELOW_OFFSET, 0)
+    if targetPosition.Y < voidThreshold + 30 then
+        targetPosition = Vector3.new(targetPosition.X, voidThreshold + 30, targetPosition.Z)
+    end
+    if rootPart.Position.Y < voidThreshold + 10 then
+        rootPart.CFrame = CFrame.new(rootPart.Position.X, voidThreshold + 30, rootPart.Position.Z)
+    end
     local offset = targetPosition - rootPart.Position
     local distance = offset.Magnitude
     if distance > MAX_FARM_DISTANCE then
@@ -693,11 +720,6 @@ end)
 local lastSafePosition = nil
 local lastFramePosition = nil
 local safePosAccumulator = 0
-local voidThreshold = -440
-do
-    local ok, destroyHeight = pcall(function() return workspace.FallenPartsDestroyHeight end)
-    if ok and typeof(destroyHeight) == "number" then voidThreshold = destroyHeight + 80 end
-end
 
 connect(RunService.Heartbeat, function(deltaTime)
     if not state.alive or not state.protection then return end
@@ -720,15 +742,19 @@ connect(RunService.Heartbeat, function(deltaTime)
         safePosAccumulator = 0
     end
     local inVoid = rootPart.Position.Y < voidThreshold
-    if inVoid and lastSafePosition and not farmingActively then
+    if inVoid then
         rootPart.AssemblyLinearVelocity = Vector3.zero
         rootPart.AssemblyAngularVelocity = Vector3.zero
-        rootPart.CFrame = CFrame.new(lastSafePosition + Vector3.new(0, 3, 0))
+        if lastSafePosition then
+            rootPart.CFrame = CFrame.new(lastSafePosition + Vector3.new(0, 3, 0))
+        else
+            rootPart.CFrame = CFrame.new(rootPart.Position.X, voidThreshold + 50, rootPart.Position.Z)
+        end
     end
     safePosAccumulator += deltaTime
     if safePosAccumulator >= 0.5 then
         safePosAccumulator = 0
-        if not humanoid.PlatformStand and humanoid.FloorMaterial ~= Enum.Material.Air and rootPart.AssemblyLinearVelocity.Magnitude < 60 then
+        if rootPart.Position.Y > voidThreshold + 50 and rootPart.AssemblyLinearVelocity.Magnitude < 30 then
             lastSafePosition = rootPart.Position
         end
     end
@@ -743,7 +769,7 @@ connect(player.Idled, function()
     end)
 end)
 
--- Character death handler - 死亡不关 autofarm
+-- Character death handler
 connect(player.CharacterAdded, function(character)
     bagKillTriggered = false
     state.bagFullActionDone = false
@@ -756,12 +782,10 @@ connect(player.CharacterAdded, function(character)
         end)
     end
     
-    -- 新回合自动恢复
     task.wait(1)
     if state.autofarm then
         state.farmPaused = false
         state.pauseReason = ""
-        print("[MM2] New round - Auto Farm resumed")
     end
 end)
 
@@ -779,21 +803,11 @@ end
 
 -- ================= LOAD SAVED CONFIG ================= --
 if savedConfig then
-    if savedConfig.autofarm then
-        state.autofarm = true
-    end
-    if savedConfig.farmSpeed then
-        state.farmSpeed = savedConfig.farmSpeed
-    end
-    if savedConfig.protection then
-        state.protection = true
-    end
-    if savedConfig.autoPickupGun then
-        state.autoPickupGun = true
-    end
-    if savedConfig.dieOnFullBag then
-        state.dieOnFullBag = true
-    end
+    if savedConfig.autofarm then state.autofarm = true end
+    if savedConfig.farmSpeed then state.farmSpeed = savedConfig.farmSpeed end
+    if savedConfig.protection then state.protection = true end
+    if savedConfig.autoPickupGun then state.autoPickupGun = true end
+    if savedConfig.dieOnFullBag then state.dieOnFullBag = true end
 end
 
 task.spawn(function()
@@ -935,8 +949,10 @@ connect(RunService.RenderStepped, function(deltaTime)
     lastBagUpdate += deltaTime
     if lastBagUpdate >= 1 then
         lastBagUpdate = 0
-        state.bagCount = math.min(state.farmed, state.bagLimit)
+        state.bagCount = state.farmed
     end
-    handleBagFullByRole()
+    if state.farmed >= state.bagLimit then
+        handleBagFullByRole()
+    end
 end)
 
